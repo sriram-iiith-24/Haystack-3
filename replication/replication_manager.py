@@ -2,12 +2,14 @@
 Replication Manager - Handles photo replication and dynamic replica adjustment
 IMPROVEMENTS:
 - Issue #4: Nightly audit for cold data monitoring
-- Issue #11: Dynamic store discovery
+- Issue #11: Dynamic store discovery (FIXED: Queries Leader directly)
 - Issue #12: Shorter stats window (60s)
 - Issue #13: De-replication implementation
+- FIX: Migrated to lifespan events
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from contextlib import asynccontextmanager
 import uvicorn
 import os
 import json
@@ -29,8 +31,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("ReplicationManager")
-
-app = FastAPI(title="Replication Manager")
 
 # Configuration
 DIRECTORY_SERVICE_URL = os.getenv("DIRECTORY_SERVICE_URL", "http://nginx")
@@ -175,29 +175,35 @@ def load_task_queue():
 
 def update_store_cache():
     """
-    Fetch current list of healthy stores from Directory Leader
-    CRITICAL FIX: Always query leader to avoid consistency issues
+    Fetch current list of healthy stores.
+    CRITICAL FIX: Always queries the LEADER directly to avoid stale follower data.
     """
     try:
-        # First, get leader info
+        # 1. Ask Nginx "Who is the leader?"
+        try:
+            response = requests.get(f"{DIRECTORY_SERVICE_URL}/stats", timeout=5)
+            if response.status_code != 200:
+                logger.warning(f"⚠ Failed to get directory stats from Nginx: {response.status_code}")
+                # Fallback to querying Nginx for stores directly if stats fail
+                target_url = DIRECTORY_SERVICE_URL
+            else:
+                stats = response.json()
+                leader_url = stats.get('current_leader_url')
+                
+                if leader_url:
+                    # We found the specific leader URL, use it!
+                    target_url = leader_url
+                else:
+                    # Fallback to Nginx if leader URL is not exposed
+                    target_url = DIRECTORY_SERVICE_URL
+        except Exception as e:
+            logger.error(f"Error fetching stats: {e}")
+            target_url = DIRECTORY_SERVICE_URL
+
+        # 2. Query the target (Leader) for healthy stores
+        # This bypasses the stale follower problem
         response = requests.get(
-            f"{DIRECTORY_SERVICE_URL}/stats",
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            logger.warning(f"⚠ Failed to get directory stats: {response.status_code}")
-            return False
-        
-        stats = response.json()
-        leader_id = stats.get('current_leader')
-        is_leader = stats.get('is_leader', False)
-        
-        logger.debug(f"Directory leader: {leader_id}, responding node is leader: {is_leader}")
-        
-        # Now fetch stores (Nginx will route to any instance, but heartbeats are replicated)
-        response = requests.get(
-            f"{DIRECTORY_SERVICE_URL}/stores",
+            f"{target_url}/stores",
             params={'healthy_only': True},
             timeout=10
         )
@@ -212,14 +218,15 @@ def update_store_cache():
                     replication_state.stores[store['store_id']] = store
                 replication_state.last_store_update = time.time()
             
-            logger.info(f"✓ Updated store cache: {len(stores)} accessible stores (HEALTHY + DEGRADED)")
-            for store in stores:
-                logger.info(f"  ├─ {store['store_id']}: status={store['status']}, "
-                          f"heartbeat_age={store.get('last_heartbeat_age', 0):.1f}s, "
-                          f"capacity={store['available_capacity']/1e9:.2f}GB")
+            # Simplified logging
+            if len(stores) > 0:
+                logger.info(f"✓ Updated store cache from {target_url}: {len(stores)} accessible stores")
+            else:
+                logger.warning(f"⚠ Updated store cache from {target_url}: 0 accessible stores (System might be initializing)")
+                
             return True
         else:
-            logger.warning(f"⚠ Failed to fetch stores: {response.status_code}")
+            logger.warning(f"⚠ Failed to fetch stores from {target_url}: {response.status_code}")
             return False
             
     except Exception as e:
@@ -566,161 +573,6 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
     except Exception as e:
         logger.error(f"✗ Error analyzing replication needs for {photo_id[:16]}...: {e}", exc_info=True)
 
-
-# API Endpoints
-
-@app.post("/stats/report")
-async def report_stats(request: dict):
-    """Receive access statistics from Store Services"""
-    try:
-        store_id = request['store_id']
-        window_start = request['window_start']
-        window_end = request['window_end']
-        access_data = request['access_data']
-        
-        logger.info(f"Received stats from {store_id}: {len(access_data)} photos")
-        
-        with replication_state.access_stats_lock:
-            for item in access_data:
-                photo_id = item['photo_id']
-                access_count = item['access_count']
-                
-                if photo_id not in replication_state.access_stats:
-                    replication_state.access_stats[photo_id] = PhotoAccessStats(
-                        photo_id=photo_id,
-                        total_accesses=0,
-                        window_start=window_start,
-                        window_end=window_end,
-                        current_replica_count=0,
-                        target_replica_count=DEFAULT_REPLICA_COUNT,
-                        access_rate_per_minute=0
-                    )
-                
-                stats = replication_state.access_stats[photo_id]
-                stats.total_accesses += access_count
-                stats.window_end = max(stats.window_end, window_end)
-                
-                window_duration_minutes = (stats.window_end - stats.window_start) / 60.0
-                if window_duration_minutes > 0:
-                    stats.access_rate_per_minute = stats.total_accesses / window_duration_minutes
-        
-        return {"success": True, "message": f"Processed stats for {len(access_data)} photos"}
-        
-    except Exception as e:
-        logger.error(f"Error processing stats report: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/replication/trigger")
-async def trigger_replication(request: dict):
-    """Manually trigger replication for a photo"""
-    try:
-        photo_id = request['photo_id']
-        
-        logger.info(f"Replication triggered for {photo_id}")
-        
-        threading.Thread(
-            target=analyze_replication_needs,
-            args=(photo_id, None),
-            daemon=True
-        ).start()
-        
-        return {"success": True, "photo_id": photo_id, "message": "Replication analysis scheduled"}
-        
-    except Exception as e:
-        logger.error(f"Error triggering replication: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/replication/status/{photo_id}")
-async def get_replication_status(photo_id: str):
-    """Get replication status for a specific photo"""
-    try:
-        locations = get_photo_locations(photo_id)
-        
-        with replication_state.tasks_lock:
-            pending_tasks = [
-                {
-                    'task_id': task.task_id,
-                    'target_store_id': task.target_store_id,
-                    'status': task.status,
-                    'priority': task.priority
-                }
-                for task in replication_state.tasks.values()
-                if task.photo_id == photo_id and task.status in [TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value]
-            ]
-        
-        with replication_state.access_stats_lock:
-            stats = replication_state.access_stats.get(photo_id)
-            access_info = None
-            if stats:
-                access_info = {
-                    'total_accesses': stats.total_accesses,
-                    'access_rate_per_minute': stats.access_rate_per_minute
-                }
-        
-        return {
-            'photo_id': photo_id,
-            'current_replica_count': len(locations),
-            'locations': locations,
-            'pending_tasks': pending_tasks,
-            'access_stats': access_info
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting replication status: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/stats")
-async def get_stats():
-    """Get Replication Manager statistics"""
-    with replication_state.tasks_lock:
-        pending_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.PENDING.value])
-        in_progress_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.IN_PROGRESS.value])
-    
-    with replication_state.access_stats_lock:
-        photos_tracked = len(replication_state.access_stats)
-        hot_photos = len([s for s in replication_state.access_stats.values() if s.access_rate_per_minute >= ACCESS_RATE_THRESHOLD])
-    
-    with replication_state.metrics_lock:
-        completed = replication_state.total_replications_completed
-        failed = replication_state.total_replications_failed
-        derepli = replication_state.total_dereplication_completed
-    
-    return {
-        'tasks': {
-            'pending': pending_count,
-            'in_progress': in_progress_count,
-            'completed': completed,
-            'failed': failed,
-            'dereplicated': derepli,
-            'queue_depth': replication_state.task_queue.qsize()
-        },
-        'access_stats': {
-            'photos_tracked': photos_tracked,
-            'hot_photos': hot_photos
-        },
-        'configuration': {
-            'default_replica_count': DEFAULT_REPLICA_COUNT,
-            'min_replica_count': MIN_REPLICA_COUNT,
-            'max_replica_count': MAX_REPLICA_COUNT,
-            'access_rate_threshold': ACCESS_RATE_THRESHOLD,
-            'worker_threads': WORKER_THREAD_COUNT
-        }
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        'status': 'healthy',
-        'worker_threads': WORKER_THREAD_COUNT,
-        'queue_depth': replication_state.task_queue.qsize()
-    }
-
-
 # Background workers
 
 def replication_worker(worker_id: int):
@@ -952,9 +804,10 @@ def persistence_worker():
             logger.error(f"Error in persistence worker: {e}", exc_info=True)
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
+# Lifespan Manager (Replaces on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize background tasks and clean up on shutdown"""
     logger.info("=" * 80)
     logger.info("Starting Replication Manager")
     logger.info("=" * 80)
@@ -992,14 +845,169 @@ async def startup_event():
     logger.info("=" * 80)
     logger.info("✓ Replication Manager started successfully")
     logger.info("=" * 80)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up on shutdown"""
+    
+    yield
+    
+    # Shutdown
     logger.info("Shutting down Replication Manager")
     save_task_queue()
     logger.info("✓ Replication Manager shut down")
+
+
+app = FastAPI(title="Replication Manager", lifespan=lifespan)
+
+# API Endpoints
+
+@app.post("/stats/report")
+async def report_stats(request: dict):
+    """Receive access statistics from Store Services"""
+    try:
+        store_id = request['store_id']
+        window_start = request['window_start']
+        window_end = request['window_end']
+        access_data = request['access_data']
+        
+        logger.info(f"Received stats from {store_id}: {len(access_data)} photos")
+        
+        with replication_state.access_stats_lock:
+            for item in access_data:
+                photo_id = item['photo_id']
+                access_count = item['access_count']
+                
+                if photo_id not in replication_state.access_stats:
+                    replication_state.access_stats[photo_id] = PhotoAccessStats(
+                        photo_id=photo_id,
+                        total_accesses=0,
+                        window_start=window_start,
+                        window_end=window_end,
+                        current_replica_count=0,
+                        target_replica_count=DEFAULT_REPLICA_COUNT,
+                        access_rate_per_minute=0
+                    )
+                
+                stats = replication_state.access_stats[photo_id]
+                stats.total_accesses += access_count
+                stats.window_end = max(stats.window_end, window_end)
+                
+                window_duration_minutes = (stats.window_end - stats.window_start) / 60.0
+                if window_duration_minutes > 0:
+                    stats.access_rate_per_minute = stats.total_accesses / window_duration_minutes
+        
+        return {"success": True, "message": f"Processed stats for {len(access_data)} photos"}
+        
+    except Exception as e:
+        logger.error(f"Error processing stats report: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/replication/trigger")
+async def trigger_replication(request: dict):
+    """Manually trigger replication for a photo"""
+    try:
+        photo_id = request['photo_id']
+        
+        logger.info(f"Replication triggered for {photo_id}")
+        
+        threading.Thread(
+            target=analyze_replication_needs,
+            args=(photo_id, None),
+            daemon=True
+        ).start()
+        
+        return {"success": True, "photo_id": photo_id, "message": "Replication analysis scheduled"}
+        
+    except Exception as e:
+        logger.error(f"Error triggering replication: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/replication/status/{photo_id}")
+async def get_replication_status(photo_id: str):
+    """Get replication status for a specific photo"""
+    try:
+        locations = get_photo_locations(photo_id)
+        
+        with replication_state.tasks_lock:
+            pending_tasks = [
+                {
+                    'task_id': task.task_id,
+                    'target_store_id': task.target_store_id,
+                    'status': task.status,
+                    'priority': task.priority
+                }
+                for task in replication_state.tasks.values()
+                if task.photo_id == photo_id and task.status in [TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value]
+            ]
+        
+        with replication_state.access_stats_lock:
+            stats = replication_state.access_stats.get(photo_id)
+            access_info = None
+            if stats:
+                access_info = {
+                    'total_accesses': stats.total_accesses,
+                    'access_rate_per_minute': stats.access_rate_per_minute
+                }
+        
+        return {
+            'photo_id': photo_id,
+            'current_replica_count': len(locations),
+            'locations': locations,
+            'pending_tasks': pending_tasks,
+            'access_stats': access_info
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting replication status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get Replication Manager statistics"""
+    with replication_state.tasks_lock:
+        pending_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.PENDING.value])
+        in_progress_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.IN_PROGRESS.value])
+    
+    with replication_state.access_stats_lock:
+        photos_tracked = len(replication_state.access_stats)
+        hot_photos = len([s for s in replication_state.access_stats.values() if s.access_rate_per_minute >= ACCESS_RATE_THRESHOLD])
+    
+    with replication_state.metrics_lock:
+        completed = replication_state.total_replications_completed
+        failed = replication_state.total_replications_failed
+        derepli = replication_state.total_dereplication_completed
+    
+    return {
+        'tasks': {
+            'pending': pending_count,
+            'in_progress': in_progress_count,
+            'completed': completed,
+            'failed': failed,
+            'dereplicated': derepli,
+            'queue_depth': replication_state.task_queue.qsize()
+        },
+        'access_stats': {
+            'photos_tracked': photos_tracked,
+            'hot_photos': hot_photos
+        },
+        'configuration': {
+            'default_replica_count': DEFAULT_REPLICA_COUNT,
+            'min_replica_count': MIN_REPLICA_COUNT,
+            'max_replica_count': MAX_REPLICA_COUNT,
+            'access_rate_threshold': ACCESS_RATE_THRESHOLD,
+            'worker_threads': WORKER_THREAD_COUNT
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        'status': 'healthy',
+        'worker_threads': WORKER_THREAD_COUNT,
+        'queue_depth': replication_state.task_queue.qsize()
+    }
 
 
 if __name__ == "__main__":

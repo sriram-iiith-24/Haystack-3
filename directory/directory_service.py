@@ -8,10 +8,13 @@ IMPROVEMENTS:
 - Issue #11: Dynamic store discovery endpoint
 - Issue #16: SHA256 checksums at directory level
 - CRITICAL FIX: Heartbeat replication and snapshot grace period
+- FIX: Migrated to lifespan events
+- FIX: Expose Leader URL in stats for smart routing
 """
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -35,13 +38,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("DirectoryService")
-
-app = FastAPI(title="Directory Service")
-
-# Rate limiting
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Configuration
 INSTANCE_ID = os.getenv("INSTANCE_ID", "directory-1")
@@ -557,6 +553,166 @@ def select_store_for_write() -> Optional[StoreInfo]:
         return selected
 
 
+# Background workers
+
+def leader_election_worker():
+    """Continuously manage leader election"""
+    logger.info("✓ Leader election worker started")
+    
+    while True:
+        try:
+            time.sleep(LEADER_HEARTBEAT_INTERVAL)
+            
+            if leadership_state.is_leader:
+                maintain_leadership()
+            else:
+                check_leadership()
+                
+                if not leadership_state.current_leader_id:
+                    try_claim_leadership()
+            
+        except Exception as e:
+            logger.error(f"✗ Error in leader election worker: {e}")
+
+
+def follower_sync_worker():
+    """
+    IMPROVEMENT #8: Faster sync (0.5s instead of 5s)
+    Sync state from leader (for followers)
+    """
+    logger.info("✓ Follower sync worker started")
+    last_synced_index = 0
+    
+    while True:
+        try:
+            time.sleep(FOLLOWER_SYNC_INTERVAL)
+            
+            if leadership_state.is_leader:
+                continue
+            
+            leader_url = get_leader_url()
+            if not leader_url:
+                continue
+            
+            response = requests.get(
+                f"{leader_url}/internal/updates",
+                params={'since_index': last_synced_index},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                updates = data.get('updates', [])
+                
+                for operation in updates:
+                    apply_operation(operation, from_wal=True)
+                    last_synced_index = max(last_synced_index, operation.get('log_index', 0))
+                
+                if updates:
+                    logger.info(f"✓ Synced {len(updates)} updates from leader")
+            
+        except Exception as e:
+            logger.error(f"✗ Error in follower sync worker: {e}")
+
+
+def snapshot_worker():
+    """Periodically save snapshots"""
+    logger.info("✓ Snapshot worker started")
+    
+    while True:
+        try:
+            time.sleep(SNAPSHOT_INTERVAL)
+            
+            if leadership_state.is_leader:
+                save_snapshot()
+            
+        except Exception as e:
+            logger.error(f"✗ Error in snapshot worker: {e}")
+
+
+def store_health_monitor():
+    """
+    Monitor store health and mark unhealthy stores
+    FIXED: More lenient thresholds to prevent false positives
+    """
+    logger.info("✓ Store health monitor started")
+    
+    while True:
+        try:
+            time.sleep(30)
+            
+            current_time = int(time.time())
+            
+            with directory_state.lock:
+                for store in directory_state.stores.values():
+                    time_since_heartbeat = current_time - store.last_heartbeat
+                    old_status = store.status
+                    
+                    # DOWN: No heartbeat for 90+ seconds (3x heartbeat interval)
+                    if time_since_heartbeat > 90:
+                        if store.status != ServiceStatus.DOWN.value:
+                            store.status = ServiceStatus.DOWN.value
+                            logger.warning(f"⚠ Store {store.store_id} marked as DOWN (no heartbeat for {time_since_heartbeat}s)")
+                    # DEGRADED: No heartbeat for 60+ seconds (2x heartbeat interval)
+                    elif time_since_heartbeat > 60:
+                        if store.status != ServiceStatus.DEGRADED.value:
+                            store.status = ServiceStatus.DEGRADED.value
+                            logger.warning(f"⚠ Store {store.store_id} marked as DEGRADED (no heartbeat for {time_since_heartbeat}s)")
+                    # HEALTHY: Recent heartbeat
+                    else:
+                        if store.status != ServiceStatus.HEALTHY.value:
+                            if old_status != ServiceStatus.HEALTHY.value:
+                                logger.info(f"✓ Store {store.store_id} marked as HEALTHY (heartbeat {time_since_heartbeat}s ago)")
+                            store.status = ServiceStatus.HEALTHY.value
+            
+        except Exception as e:
+            logger.error(f"✗ Error in store health monitor: {e}")
+
+# Lifespan Manager (Replaces on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize background tasks and clean up on shutdown"""
+    # Startup
+    logger.info("=" * 80)
+    logger.info(f"🚀 Starting Directory Service: {INSTANCE_ID}")
+    logger.info("=" * 80)
+    
+    # Discover peer instances
+    discover_followers()
+    
+    # Load persisted state
+    load_snapshot()
+    load_wal()
+    
+    # Start leader election
+    check_leadership()
+    if not leadership_state.current_leader_id:
+        try_claim_leadership()
+    
+    # Start background workers
+    threading.Thread(target=leader_election_worker, daemon=True, name="LeaderElection").start()
+    threading.Thread(target=follower_sync_worker, daemon=True, name="FollowerSync").start()
+    threading.Thread(target=snapshot_worker, daemon=True, name="Snapshot").start()
+    threading.Thread(target=store_health_monitor, daemon=True, name="HealthMonitor").start()
+    
+    logger.info(f"✓ Background workers started")
+    logger.info(f"✓ Directory Service ready. Leader: {leadership_state.is_leader}")
+    
+    yield
+    
+    # Shutdown
+    if leadership_state.is_leader:
+        save_snapshot()
+    logger.info("Directory Service shutting down")
+
+
+app = FastAPI(title="Directory Service", lifespan=lifespan)
+
+# Rate limiting setup
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
 # API Endpoints
 
 @app.post("/allocate")
@@ -1061,7 +1217,10 @@ async def remove_replica(request: dict):
 
 @app.get("/stats")
 async def get_stats():
-    """Get directory statistics"""
+    """
+    Get directory statistics
+    FIX: Returns current_leader_url to help clients find the authority
+    """
     with directory_state.lock:
         total_photos = len(directory_state.photos)
         total_stores = len(directory_state.stores)
@@ -1080,6 +1239,7 @@ async def get_stats():
         'instance_id': INSTANCE_ID,
         'is_leader': leadership_state.is_leader,
         'current_leader': leadership_state.current_leader_id,
+        'current_leader_url': leadership_state.current_leader_url,  # ADDED THIS
         'term_number': leadership_state.term_number,
         'total_photos': total_photos,
         'total_stores': total_stores,
@@ -1190,152 +1350,6 @@ def delete_from_store(store_url: str, photo_id: str):
         
     except Exception as e:
         logger.warning(f"⚠ Failed to delete from store {store_url}: {e}")
-
-
-# Background workers
-
-def leader_election_worker():
-    """Continuously manage leader election"""
-    logger.info("✓ Leader election worker started")
-    
-    while True:
-        try:
-            time.sleep(LEADER_HEARTBEAT_INTERVAL)
-            
-            if leadership_state.is_leader:
-                maintain_leadership()
-            else:
-                check_leadership()
-                
-                if not leadership_state.current_leader_id:
-                    try_claim_leadership()
-            
-        except Exception as e:
-            logger.error(f"✗ Error in leader election worker: {e}")
-
-
-def follower_sync_worker():
-    """
-    IMPROVEMENT #8: Faster sync (0.5s instead of 5s)
-    Sync state from leader (for followers)
-    """
-    logger.info("✓ Follower sync worker started")
-    last_synced_index = 0
-    
-    while True:
-        try:
-            time.sleep(FOLLOWER_SYNC_INTERVAL)
-            
-            if leadership_state.is_leader:
-                continue
-            
-            leader_url = get_leader_url()
-            if not leader_url:
-                continue
-            
-            response = requests.get(
-                f"{leader_url}/internal/updates",
-                params={'since_index': last_synced_index},
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                updates = data.get('updates', [])
-                
-                for operation in updates:
-                    apply_operation(operation, from_wal=True)
-                    last_synced_index = max(last_synced_index, operation.get('log_index', 0))
-                
-                if updates:
-                    logger.info(f"✓ Synced {len(updates)} updates from leader")
-            
-        except Exception as e:
-            logger.error(f"✗ Error in follower sync worker: {e}")
-
-
-def snapshot_worker():
-    """Periodically save snapshots"""
-    logger.info("✓ Snapshot worker started")
-    
-    while True:
-        try:
-            time.sleep(SNAPSHOT_INTERVAL)
-            
-            if leadership_state.is_leader:
-                save_snapshot()
-            
-        except Exception as e:
-            logger.error(f"✗ Error in snapshot worker: {e}")
-
-
-def store_health_monitor():
-    """
-    Monitor store health and mark unhealthy stores
-    FIXED: More lenient thresholds to prevent false positives
-    """
-    logger.info("✓ Store health monitor started")
-    
-    while True:
-        try:
-            time.sleep(30)
-            
-            current_time = int(time.time())
-            
-            with directory_state.lock:
-                for store in directory_state.stores.values():
-                    time_since_heartbeat = current_time - store.last_heartbeat
-                    old_status = store.status
-                    
-                    # DOWN: No heartbeat for 90+ seconds (3x heartbeat interval)
-                    if time_since_heartbeat > 90:
-                        if store.status != ServiceStatus.DOWN.value:
-                            store.status = ServiceStatus.DOWN.value
-                            logger.warning(f"⚠ Store {store.store_id} marked as DOWN (no heartbeat for {time_since_heartbeat}s)")
-                    # DEGRADED: No heartbeat for 60+ seconds (2x heartbeat interval)
-                    elif time_since_heartbeat > 60:
-                        if store.status != ServiceStatus.DEGRADED.value:
-                            store.status = ServiceStatus.DEGRADED.value
-                            logger.warning(f"⚠ Store {store.store_id} marked as DEGRADED (no heartbeat for {time_since_heartbeat}s)")
-                    # HEALTHY: Recent heartbeat
-                    else:
-                        if store.status != ServiceStatus.HEALTHY.value:
-                            if old_status != ServiceStatus.HEALTHY.value:
-                                logger.info(f"✓ Store {store.store_id} marked as HEALTHY (heartbeat {time_since_heartbeat}s ago)")
-                            store.status = ServiceStatus.HEALTHY.value
-            
-        except Exception as e:
-            logger.error(f"✗ Error in store health monitor: {e}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    logger.info("=" * 80)
-    logger.info(f"🚀 Starting Directory Service: {INSTANCE_ID}")
-    logger.info("=" * 80)
-    
-    # Discover peer instances
-    discover_followers()
-    
-    # Load persisted state
-    load_snapshot()
-    load_wal()
-    
-    # Start leader election
-    check_leadership()
-    if not leadership_state.current_leader_id:
-        try_claim_leadership()
-    
-    # Start background workers
-    threading.Thread(target=leader_election_worker, daemon=True, name="LeaderElection").start()
-    threading.Thread(target=follower_sync_worker, daemon=True, name="FollowerSync").start()
-    threading.Thread(target=snapshot_worker, daemon=True, name="Snapshot").start()
-    threading.Thread(target=store_health_monitor, daemon=True, name="HealthMonitor").start()
-    
-    logger.info(f"✓ Background workers started")
-    logger.info(f"✓ Directory Service ready. Leader: {leadership_state.is_leader}")
-    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
