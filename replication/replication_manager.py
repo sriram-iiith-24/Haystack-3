@@ -192,7 +192,9 @@ def update_store_cache():
                     replication_state.stores[store['store_id']] = store
                 replication_state.last_store_update = time.time()
             
-            logger.debug(f"Updated store cache: {len(stores)} healthy stores")
+            logger.info(f"Updated store cache: {len(stores)} accessible stores (includes HEALTHY and DEGRADED)")
+            for store in stores:
+                logger.debug(f"  - {store['store_id']}: {store['status']}, capacity: {store['available_capacity']/1e9:.2f}GB")
             return True
         else:
             logger.warning(f"Failed to fetch stores: {response.status_code}")

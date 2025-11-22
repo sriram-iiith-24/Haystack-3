@@ -504,9 +504,10 @@ def select_store_for_write() -> Optional[StoreInfo]:
     with directory_state.lock:
         available_stores = [
             store for store in directory_state.stores.values()
-            if store.status == ServiceStatus.HEALTHY.value
+            # Accept HEALTHY and DEGRADED stores for writes (exclude DOWN only)
+            if store.status != ServiceStatus.DOWN.value
             and store.available_capacity > 100 * 1024 * 1024
-            and time.time() - store.last_heartbeat < 60
+            and time.time() - store.last_heartbeat < 90  # Within 90 seconds
         ]
         
         if not available_stores:
@@ -637,7 +638,8 @@ async def register_photo(request: Request):
 async def locate_photo(photo_id: str):
     """
     IMPROVEMENT #3: Filter out unhealthy stores
-    Get locations where a photo is stored (only healthy stores)
+    Get locations where a photo is stored (only healthy/degraded stores)
+    Note: DEGRADED stores are included - they're slow but still accessible
     """
     try:
         with directory_state.lock:
@@ -646,20 +648,20 @@ async def locate_photo(photo_id: str):
             
             metadata = directory_state.photos[photo_id]
             
-            # Filter for active replicas on HEALTHY stores only
+            # Filter for active replicas on HEALTHY or DEGRADED stores
+            # We include DEGRADED because the store is still accessible, just slow
             healthy_locations = []
             for loc in metadata.replicas:
                 if loc.status != 'active':
                     continue
                 
-                # Check if the store itself is healthy
+                # Check if the store itself is not DOWN
                 store = directory_state.stores.get(loc.store_id)
                 if not store:
                     continue
                 
-                # Only include if store is healthy and has recent heartbeat
-                if (store.status == ServiceStatus.HEALTHY.value and 
-                    time.time() - store.last_heartbeat < 60):
+                # Include HEALTHY and DEGRADED, exclude DOWN
+                if store.status != ServiceStatus.DOWN.value:
                     healthy_locations.append({
                         'store_id': loc.store_id,
                         'store_url': loc.store_url,
@@ -667,7 +669,7 @@ async def locate_photo(photo_id: str):
                     })
             
             if not healthy_locations:
-                raise HTTPException(status_code=404, detail="No healthy replicas found")
+                raise HTTPException(status_code=404, detail="No accessible replicas found")
             
             return {
                 'photo_id': photo_id,
@@ -805,12 +807,13 @@ async def store_heartbeat(request: dict):
 async def list_stores(healthy_only: bool = True):
     """
     IMPROVEMENT #11: Dynamic store discovery
-    List all registered stores
+    List all registered stores (includes DEGRADED if healthy_only=True)
     """
     with directory_state.lock:
         stores = []
         for store in directory_state.stores.values():
-            if healthy_only and store.status != ServiceStatus.HEALTHY.value:
+            # If healthy_only, exclude DOWN stores but include DEGRADED
+            if healthy_only and store.status == ServiceStatus.DOWN.value:
                 continue
             
             stores.append({
@@ -839,18 +842,18 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
             for photo_id in page:
                 metadata = directory_state.photos[photo_id]
                 
-                # Count only healthy replicas
-                healthy_count = 0
+                # Count accessible replicas (HEALTHY or DEGRADED stores)
+                accessible_count = 0
                 for loc in metadata.replicas:
                     if loc.status != 'active':
                         continue
                     store = directory_state.stores.get(loc.store_id)
-                    if store and store.status == ServiceStatus.HEALTHY.value:
-                        healthy_count += 1
+                    if store and store.status != ServiceStatus.DOWN.value:
+                        accessible_count += 1
                 
                 photos.append({
                     'photo_id': photo_id,
-                    'replica_count': healthy_count,
+                    'replica_count': accessible_count,
                     'target_replicas': metadata.target_replica_count,
                     'created_at': metadata.created_at,
                     'checksum': metadata.sha256_checksum,
@@ -1130,14 +1133,23 @@ def store_health_monitor():
             
             with directory_state.lock:
                 for store in directory_state.stores.values():
-                    if current_time - store.last_heartbeat > 60:
+                    time_since_heartbeat = current_time - store.last_heartbeat
+                    
+                    # DOWN: No heartbeat for 90+ seconds (3x heartbeat interval)
+                    if time_since_heartbeat > 90:
                         if store.status != ServiceStatus.DOWN.value:
                             store.status = ServiceStatus.DOWN.value
-                            logger.warning(f"Store {store.store_id} marked as DOWN")
-                    elif current_time - store.last_heartbeat > 30:
+                            logger.warning(f"Store {store.store_id} marked as DOWN (no heartbeat for {time_since_heartbeat}s)")
+                    # DEGRADED: No heartbeat for 60+ seconds (2x heartbeat interval)
+                    elif time_since_heartbeat > 60:
                         if store.status != ServiceStatus.DEGRADED.value:
                             store.status = ServiceStatus.DEGRADED.value
-                            logger.warning(f"Store {store.store_id} marked as DEGRADED")
+                            logger.warning(f"Store {store.store_id} marked as DEGRADED (no heartbeat for {time_since_heartbeat}s)")
+                    # HEALTHY: Recent heartbeat
+                    else:
+                        if store.status != ServiceStatus.HEALTHY.value:
+                            store.status = ServiceStatus.HEALTHY.value
+                            logger.info(f"Store {store.store_id} marked as HEALTHY")
             
         except Exception as e:
             logger.error(f"Error in store health monitor: {e}")
