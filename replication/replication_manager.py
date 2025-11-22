@@ -174,8 +174,28 @@ def load_task_queue():
 # IMPROVEMENT #11: Dynamic store discovery
 
 def update_store_cache():
-    """Fetch current list of healthy stores from Directory"""
+    """
+    Fetch current list of healthy stores from Directory Leader
+    CRITICAL FIX: Always query leader to avoid consistency issues
+    """
     try:
+        # First, get leader info
+        response = requests.get(
+            f"{DIRECTORY_SERVICE_URL}/stats",
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"⚠ Failed to get directory stats: {response.status_code}")
+            return False
+        
+        stats = response.json()
+        leader_id = stats.get('current_leader')
+        is_leader = stats.get('is_leader', False)
+        
+        logger.debug(f"Directory leader: {leader_id}, responding node is leader: {is_leader}")
+        
+        # Now fetch stores (Nginx will route to any instance, but heartbeats are replicated)
         response = requests.get(
             f"{DIRECTORY_SERVICE_URL}/stores",
             params={'healthy_only': True},
@@ -192,16 +212,18 @@ def update_store_cache():
                     replication_state.stores[store['store_id']] = store
                 replication_state.last_store_update = time.time()
             
-            logger.info(f"Updated store cache: {len(stores)} accessible stores (includes HEALTHY and DEGRADED)")
+            logger.info(f"✓ Updated store cache: {len(stores)} accessible stores (HEALTHY + DEGRADED)")
             for store in stores:
-                logger.debug(f"  - {store['store_id']}: {store['status']}, capacity: {store['available_capacity']/1e9:.2f}GB")
+                logger.info(f"  ├─ {store['store_id']}: status={store['status']}, "
+                          f"heartbeat_age={store.get('last_heartbeat_age', 0):.1f}s, "
+                          f"capacity={store['available_capacity']/1e9:.2f}GB")
             return True
         else:
-            logger.warning(f"Failed to fetch stores: {response.status_code}")
+            logger.warning(f"⚠ Failed to fetch stores: {response.status_code}")
             return False
             
     except Exception as e:
-        logger.error(f"Error updating store cache: {e}")
+        logger.error(f"✗ Error updating store cache: {e}")
         return False
 
 
@@ -403,8 +425,13 @@ def execute_dereplication(photo_id: str, store_id: str, store_url: str) -> bool:
 # Photo analysis functions
 
 def get_photo_locations(photo_id: str) -> List[dict]:
-    """Get all locations where a photo is stored"""
+    """
+    Get all locations where a photo is stored
+    IMPROVEMENT: Always queries through Nginx which routes to leader/followers
+    """
     try:
+        logger.debug(f"→ Fetching locations for photo {photo_id[:16]}...")
+        
         response = requests.get(
             f"{DIRECTORY_SERVICE_URL}/locate/{photo_id}",
             timeout=10
@@ -412,27 +439,34 @@ def get_photo_locations(photo_id: str) -> List[dict]:
         
         if response.status_code == 200:
             data = response.json()
-            return data.get('locations', [])
+            locations = data.get('locations', [])
+            logger.debug(f"✓ Found {len(locations)} locations for {photo_id[:16]}...")
+            return locations
         elif response.status_code == 404:
+            logger.debug(f"⚠ Photo {photo_id[:16]}... not found in directory")
             return []
         else:
-            logger.error(f"Failed to locate photo {photo_id}: {response.status_code}")
+            logger.error(f"✗ Failed to locate photo {photo_id[:16]}...: {response.status_code}")
             return []
         
     except Exception as e:
-        logger.error(f"Error locating photo {photo_id}: {e}", exc_info=True)
+        logger.error(f"✗ Error locating photo {photo_id[:16]}...: {e}", exc_info=True)
         return []
 
 
 def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessStats] = None):
     """Analyze if a photo needs more or fewer replicas"""
     try:
+        logger.debug(f"→ Analyzing replication needs for {photo_id[:16]}...")
+        
         locations = get_photo_locations(photo_id)
         current_replica_count = len(locations)
         
         if current_replica_count == 0:
-            logger.warning(f"Photo {photo_id} has no replicas, cannot replicate")
+            logger.warning(f"⚠ Photo {photo_id[:16]}... has no replicas, cannot replicate")
             return
+        
+        logger.info(f"Photo {photo_id[:16]}... currently has {current_replica_count} replica(s)")
         
         # Determine target replica count
         target_replica_count = DEFAULT_REPLICA_COUNT
@@ -440,21 +474,26 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
         if access_stats:
             if access_stats.access_rate_per_minute >= HIGH_ACCESS_THRESHOLD:
                 target_replica_count = min(MAX_REPLICA_COUNT, DEFAULT_REPLICA_COUNT + 2)
-                logger.info(f"Photo {photo_id} is very hot ({access_stats.access_rate_per_minute:.1f} req/min), target={target_replica_count}")
+                logger.info(f"  ✓ Very hot photo ({access_stats.access_rate_per_minute:.1f} req/min), "
+                          f"increasing target to {target_replica_count}")
             elif access_stats.access_rate_per_minute >= ACCESS_RATE_THRESHOLD:
                 target_replica_count = min(MAX_REPLICA_COUNT, DEFAULT_REPLICA_COUNT + 1)
-                logger.info(f"Photo {photo_id} is hot ({access_stats.access_rate_per_minute:.1f} req/min), target={target_replica_count}")
+                logger.info(f"  ✓ Hot photo ({access_stats.access_rate_per_minute:.1f} req/min), "
+                          f"increasing target to {target_replica_count}")
         
         replicas_needed = target_replica_count - current_replica_count
         
         if replicas_needed > 0:
             # Need more replicas
-            logger.info(f"Photo {photo_id} needs {replicas_needed} more replica(s)")
+            logger.info(f"  → Photo {photo_id[:16]}... needs {replicas_needed} more replica(s) "
+                       f"(current: {current_replica_count}, target: {target_replica_count})")
             
             if current_replica_count == 1:
                 priority = TaskPriority.URGENT
+                logger.warning(f"  ⚠ URGENT: Only 1 replica exists!")
             elif current_replica_count < MIN_REPLICA_COUNT:
                 priority = TaskPriority.HIGH
+                logger.warning(f"  ⚠ HIGH: Below minimum replica count ({MIN_REPLICA_COUNT})")
             elif access_stats and access_stats.access_rate_per_minute >= HIGH_ACCESS_THRESHOLD:
                 priority = TaskPriority.HIGH
             elif current_replica_count < DEFAULT_REPLICA_COUNT:
@@ -463,14 +502,18 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
                 priority = TaskPriority.LOW
             
             existing_store_ids = {loc['store_id'] for loc in locations}
+            logger.debug(f"  Existing stores: {existing_store_ids}")
             
             for i in range(replicas_needed):
                 source = locations[0]
                 target_store = select_target_store(photo_id, existing_store_ids)
                 
                 if not target_store:
-                    logger.warning(f"Cannot create replica {i+1}/{replicas_needed} for {photo_id}")
+                    logger.warning(f"  ✗ Cannot create replica {i+1}/{replicas_needed} for {photo_id[:16]}...: no available target store")
                     break
+                
+                logger.info(f"  → Creating replication task {i+1}/{replicas_needed}: "
+                          f"{source['store_id']} → {target_store['store_id']} (priority: {priority.name})")
                 
                 create_replication_task(
                     photo_id=photo_id,
@@ -487,7 +530,8 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
         elif replicas_needed < 0:
             # IMPROVEMENT #13: De-replication
             excess_count = abs(replicas_needed)
-            logger.info(f"Photo {photo_id} has {excess_count} excess replica(s)")
+            logger.info(f"  → Photo {photo_id[:16]}... has {excess_count} excess replica(s) "
+                       f"(current: {current_replica_count}, target: {target_replica_count})")
             
             # Get store capacities
             store_capacities = {}
@@ -507,7 +551,8 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
             for i in range(min(excess_count, len(sorted_locations) - MIN_REPLICA_COUNT)):
                 loc_to_remove = sorted_locations[i]
                 
-                logger.info(f"Scheduling de-replication: remove {photo_id} from {loc_to_remove['store_id']}")
+                logger.info(f"  → Scheduling de-replication {i+1}/{excess_count}: "
+                          f"remove {photo_id[:16]}... from {loc_to_remove['store_id']}")
                 
                 # Execute de-replication in background
                 threading.Thread(
@@ -515,9 +560,11 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
                     args=(photo_id, loc_to_remove['store_id'], loc_to_remove['store_url']),
                     daemon=True
                 ).start()
+        else:
+            logger.debug(f"  ✓ Photo {photo_id[:16]}... has optimal replica count ({current_replica_count})")
         
     except Exception as e:
-        logger.error(f"Error analyzing replication needs for {photo_id}: {e}", exc_info=True)
+        logger.error(f"✗ Error analyzing replication needs for {photo_id[:16]}...: {e}", exc_info=True)
 
 
 # API Endpoints
