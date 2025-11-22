@@ -1,0 +1,319 @@
+version: '3.8'
+
+services:
+  # Redis for caching and leader election
+  redis:
+    image: redis:7-alpine
+    container_name: haystack-redis
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+      - redis-data:/data
+    networks:
+      - haystack-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Nginx Load Balancer
+  nginx:
+    build: ./nginx
+    container_name: haystack-nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - directory-1
+      - directory-2
+      - directory-3
+    networks:
+      - haystack-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # Store Services
+  store-1:
+    build: ./store
+    container_name: haystack-store-1
+    ports:
+      - "8001:8000"
+    environment:
+      - STORE_ID=store-1
+      - STORE_URL=http://store-1:8000
+      - VOLUME_DIRECTORY=/data/volumes
+      - MAX_VOLUME_SIZE=4294967296
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REDIS_URL=redis://redis:6379
+      - STATS_REPORT_INTERVAL=60
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      - ./data/store-1:/data/volumes
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  store-2:
+    build: ./store
+    container_name: haystack-store-2
+    ports:
+      - "8002:8000"
+    environment:
+      - STORE_ID=store-2
+      - STORE_URL=http://store-2:8000
+      - VOLUME_DIRECTORY=/data/volumes
+      - MAX_VOLUME_SIZE=4294967296
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REDIS_URL=redis://redis:6379
+      - STATS_REPORT_INTERVAL=60
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      - ./data/store-2:/data/volumes
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  store-3:
+    build: ./store
+    container_name: haystack-store-3
+    ports:
+      - "8003:8000"
+    environment:
+      - STORE_ID=store-3
+      - STORE_URL=http://store-3:8000
+      - VOLUME_DIRECTORY=/data/volumes
+      - MAX_VOLUME_SIZE=4294967296
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REDIS_URL=redis://redis:6379
+      - STATS_REPORT_INTERVAL=60
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      - ./data/store-3:/data/volumes
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  store-4:
+    build: ./store
+    container_name: haystack-store-4
+    ports:
+      - "8004:8000"
+    environment:
+      - STORE_ID=store-4
+      - STORE_URL=http://store-4:8000
+      - VOLUME_DIRECTORY=/data/volumes
+      - MAX_VOLUME_SIZE=4294967296
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REDIS_URL=redis://redis:6379
+      - STATS_REPORT_INTERVAL=60
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      - ./data/store-4:/data/volumes
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  store-5:
+    build: ./store
+    container_name: haystack-store-5
+    ports:
+      - "8005:8000"
+    environment:
+      - STORE_ID=store-5
+      - STORE_URL=http://store-5:8000
+      - VOLUME_DIRECTORY=/data/volumes
+      - MAX_VOLUME_SIZE=4294967296
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REDIS_URL=redis://redis:6379
+      - STATS_REPORT_INTERVAL=60
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      - ./data/store-5:/data/volumes
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Directory Services (3 replicas with Redis-based leader election)
+  directory-1:
+    build: ./directory
+    container_name: haystack-directory-1
+    ports:
+      - "9000:9000"
+    environment:
+      - INSTANCE_ID=directory-1
+      - INSTANCE_URL=http://directory-1:9000
+      - DATA_DIRECTORY=/data/directory
+      - REDIS_URL=redis://redis:6379
+      - LEADER_TIMEOUT=10
+      - LEADER_HEARTBEAT_INTERVAL=3
+      - FOLLOWER_SYNC_INTERVAL=0.5
+      - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9003
+    volumes:
+      - ./data/directory-1:/data/directory
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  directory-2:
+    build: ./directory
+    container_name: haystack-directory-2
+    ports:
+      - "9001:9000"
+    environment:
+      - INSTANCE_ID=directory-2
+      - INSTANCE_URL=http://directory-2:9000
+      - DATA_DIRECTORY=/data/directory
+      - REDIS_URL=redis://redis:6379
+      - LEADER_TIMEOUT=10
+      - LEADER_HEARTBEAT_INTERVAL=3
+      - FOLLOWER_SYNC_INTERVAL=0.5
+      - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9003
+    volumes:
+      - ./data/directory-2:/data/directory
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  directory-3:
+    build: ./directory
+    container_name: haystack-directory-3
+    ports:
+      - "9002:9000"
+    environment:
+      - INSTANCE_ID=directory-3
+      - INSTANCE_URL=http://directory-3:9000
+      - DATA_DIRECTORY=/data/directory
+      - REDIS_URL=redis://redis:6379
+      - LEADER_TIMEOUT=10
+      - LEADER_HEARTBEAT_INTERVAL=3
+      - FOLLOWER_SYNC_INTERVAL=0.5
+      - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9003
+    volumes:
+      - ./data/directory-3:/data/directory
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Replication Manager
+  replication:
+    build: ./replication
+    container_name: haystack-replication
+    ports:
+      - "9003:9003"
+    environment:
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - DEFAULT_REPLICA_COUNT=3
+      - MAX_REPLICA_COUNT=5
+      - MIN_REPLICA_COUNT=2
+      - ACCESS_RATE_THRESHOLD=200
+      - HIGH_ACCESS_THRESHOLD=500
+      - WORKER_THREAD_COUNT=5
+      - STATS_COLLECTION_INTERVAL=60
+      - MONITORING_INTERVAL=60
+      - NIGHTLY_AUDIT_HOUR=2
+      - DATA_DIRECTORY=/data/replication
+    volumes:
+      - ./data/replication:/data/replication
+    networks:
+      - haystack-network
+    depends_on:
+      - nginx
+    restart: unless-stopped
+
+  # Cache Service (Redis wrapper)
+  cache:
+    build: ./cache
+    container_name: haystack-cache
+    ports:
+      - "8100:8100"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CACHE_TTL=3600
+    networks:
+      - haystack-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  
+  # Client
+  client:
+    build: ./client
+    container_name: haystack-client
+    environment:
+      - DIRECTORY_SERVICE_URL=http://nginx
+      - CACHE_SERVICE_URL=http://cache:8100
+      - REPLICATION_MANAGER_URL=http://replication:9003
+    volumes:
+      - ./client:/app
+      - ./test-images:/images
+    networks:
+      - haystack-network
+    depends_on:
+      - nginx
+      - cache
+      - replication
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+networks:
+  haystack-network:
+    name: haystack-network
+    driver: bridge
+
+volumes:
+  redis-data:
+  store-1-data:
+  store-2-data:
+  store-3-data:
+  store-4-data:
+  store-5-data:
+  directory-1-data:
+  directory-2-data:
+  directory-3-data:
+  replication-data:
