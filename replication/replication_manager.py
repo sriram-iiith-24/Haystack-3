@@ -1,11 +1,10 @@
 """
-Replication Manager - Handles photo replication and dynamic replica adjustment
-IMPROVEMENTS:
-- Issue #4: Nightly audit for cold data monitoring
-- Issue #11: Dynamic store discovery (FIXED: Queries Leader directly)
-- Issue #12: Shorter stats window (60s)
-- Issue #13: De-replication implementation
-- FIX: Migrated to lifespan events
+Replication Manager - FIXED VERSION
+Critical fixes:
+1. Always queries leader directly for consistent reads
+2. Task deduplication to prevent duplicate replication
+3. Proper error handling for removed stores
+4. Request ID for tracing
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -24,11 +23,12 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import queue
 from datetime import datetime, timedelta
+import uuid
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] %(message)s'
 )
 logger = logging.getLogger("ReplicationManager")
 
@@ -40,9 +40,9 @@ MIN_REPLICA_COUNT = int(os.getenv("MIN_REPLICA_COUNT", 2))
 ACCESS_RATE_THRESHOLD = int(os.getenv("ACCESS_RATE_THRESHOLD", 200))
 HIGH_ACCESS_THRESHOLD = int(os.getenv("HIGH_ACCESS_THRESHOLD", 500))
 WORKER_THREAD_COUNT = int(os.getenv("WORKER_THREAD_COUNT", 5))
-STATS_COLLECTION_INTERVAL = int(os.getenv("STATS_COLLECTION_INTERVAL", 60))  # IMPROVEMENT #12
+STATS_COLLECTION_INTERVAL = int(os.getenv("STATS_COLLECTION_INTERVAL", 60))
 MONITORING_INTERVAL = int(os.getenv("MONITORING_INTERVAL", 60))
-NIGHTLY_AUDIT_HOUR = int(os.getenv("NIGHTLY_AUDIT_HOUR", 2))  # IMPROVEMENT #4
+NIGHTLY_AUDIT_HOUR = int(os.getenv("NIGHTLY_AUDIT_HOUR", 2))
 DATA_DIRECTORY = os.getenv("DATA_DIRECTORY", "/data/replication")
 TASK_QUEUE_FILE = os.path.join(DATA_DIRECTORY, "task_queue.json")
 
@@ -80,7 +80,6 @@ class ReplicationTask:
 
 @dataclass
 class DeReplicationTask:
-    """IMPROVEMENT #13: Task for removing excess replicas"""
     task_id: str
     photo_id: str
     store_id: str
@@ -101,19 +100,24 @@ class PhotoAccessStats:
 
 
 class ReplicationState:
-    """Manages replication manager state"""
     def __init__(self):
         self.task_queue = queue.PriorityQueue()
         self.tasks: Dict[str, ReplicationTask] = {}
         self.tasks_lock = threading.RLock()
         
+        # FIX: Track pending task keys to prevent duplicates
+        self.pending_task_keys: Set[str] = set()  # Set of "photo_id:target_store_id"
+        
         self.access_stats: Dict[str, PhotoAccessStats] = {}
         self.access_stats_lock = threading.RLock()
         
-        # IMPROVEMENT #11: Dynamic store cache
         self.stores: Dict[str, dict] = {}
         self.stores_lock = threading.RLock()
         self.last_store_update = 0
+        
+        # FIX: Track failed stores for circuit breaker
+        self.failed_stores: Dict[str, int] = defaultdict(int)  # store_id -> failure_count
+        self.failed_stores_lock = threading.Lock()
         
         self.total_replications_completed = 0
         self.total_replications_failed = 0
@@ -123,6 +127,32 @@ class ReplicationState:
 
 # Global state
 replication_state = ReplicationState()
+
+
+# FIX: Helper function to get leader URL directly
+def get_leader_url() -> str:
+    """
+    Get leader URL from directory stats
+    Critical fix: Always returns leader URL for consistent reads
+    """
+    try:
+        response = requests.get(f"{DIRECTORY_SERVICE_URL}/stats", timeout=5)
+        if response.status_code == 200:
+            stats = response.json()
+            leader_url = stats.get('current_leader_url')
+            
+            if leader_url:
+                return leader_url
+            else:
+                # Fallback to Nginx if leader URL not exposed
+                logger.warning("Leader URL not in stats, using Nginx")
+                return DIRECTORY_SERVICE_URL
+        else:
+            logger.warning(f"Failed to get stats: {response.status_code}")
+            return DIRECTORY_SERVICE_URL
+    except Exception as e:
+        logger.error(f"Error getting leader URL: {e}")
+        return DIRECTORY_SERVICE_URL
 
 
 # Persistence functions
@@ -164,6 +194,10 @@ def load_task_queue():
             with replication_state.tasks_lock:
                 replication_state.tasks[task.task_id] = task
                 replication_state.task_queue.put((task.priority, task.task_id))
+                
+                # Rebuild pending task keys
+                task_key = f"{task.photo_id}:{task.target_store_id}"
+                replication_state.pending_task_keys.add(task_key)
         
         logger.info(f"Loaded {len(tasks_data)} tasks from disk")
         
@@ -171,39 +205,18 @@ def load_task_queue():
         logger.error(f"Error loading task queue: {e}", exc_info=True)
 
 
-# IMPROVEMENT #11: Dynamic store discovery
+# Store discovery
 
 def update_store_cache():
     """
-    Fetch current list of healthy stores.
-    CRITICAL FIX: Always queries the LEADER directly to avoid stale follower data.
+    Fetch current list of healthy stores
+    FIX: Always queries the LEADER directly
     """
     try:
-        # 1. Ask Nginx "Who is the leader?"
-        try:
-            response = requests.get(f"{DIRECTORY_SERVICE_URL}/stats", timeout=5)
-            if response.status_code != 200:
-                logger.warning(f"⚠ Failed to get directory stats from Nginx: {response.status_code}")
-                # Fallback to querying Nginx for stores directly if stats fail
-                target_url = DIRECTORY_SERVICE_URL
-            else:
-                stats = response.json()
-                leader_url = stats.get('current_leader_url')
-                
-                if leader_url:
-                    # We found the specific leader URL, use it!
-                    target_url = leader_url
-                else:
-                    # Fallback to Nginx if leader URL is not exposed
-                    target_url = DIRECTORY_SERVICE_URL
-        except Exception as e:
-            logger.error(f"Error fetching stats: {e}")
-            target_url = DIRECTORY_SERVICE_URL
-
-        # 2. Query the target (Leader) for healthy stores
-        # This bypasses the stale follower problem
+        leader_url = get_leader_url()
+        
         response = requests.get(
-            f"{target_url}/stores",
+            f"{leader_url}/stores",
             params={'healthy_only': True},
             timeout=10
         )
@@ -218,15 +231,14 @@ def update_store_cache():
                     replication_state.stores[store['store_id']] = store
                 replication_state.last_store_update = time.time()
             
-            # Simplified logging
             if len(stores) > 0:
-                logger.info(f"✓ Updated store cache from {target_url}: {len(stores)} accessible stores")
+                logger.info(f"✓ Updated store cache from leader: {len(stores)} stores")
             else:
-                logger.warning(f"⚠ Updated store cache from {target_url}: 0 accessible stores (System might be initializing)")
+                logger.warning(f"⚠ Store cache from leader: 0 stores")
                 
             return True
         else:
-            logger.warning(f"⚠ Failed to fetch stores from {target_url}: {response.status_code}")
+            logger.warning(f"⚠ Failed to fetch stores: {response.status_code}")
             return False
             
     except Exception as e:
@@ -235,8 +247,7 @@ def update_store_cache():
 
 
 def get_available_stores() -> List[dict]:
-    """Get list of healthy stores (with caching)"""
-    # Refresh cache if stale (> 30 seconds old)
+    """Get list of healthy stores with caching"""
     if time.time() - replication_state.last_store_update > 30:
         update_store_cache()
     
@@ -245,7 +256,10 @@ def get_available_stores() -> List[dict]:
 
 
 def select_target_store(photo_id: str, existing_store_ids: Set[str]) -> Optional[dict]:
-    """Select the best store for a new replica"""
+    """
+    Select the best store for a new replica
+    FIX: Excludes stores with high failure rate
+    """
     try:
         available_stores = get_available_stores()
         
@@ -253,10 +267,13 @@ def select_target_store(photo_id: str, existing_store_ids: Set[str]) -> Optional
             logger.warning("No available stores for replication")
             return None
         
-        candidate_stores = [
-            store for store in available_stores
-            if store['store_id'] not in existing_store_ids
-        ]
+        # FIX: Filter out failed stores
+        with replication_state.failed_stores_lock:
+            candidate_stores = [
+                store for store in available_stores
+                if store['store_id'] not in existing_store_ids
+                and replication_state.failed_stores.get(store['store_id'], 0) < 5
+            ]
         
         if not candidate_stores:
             logger.warning(f"No candidate stores for photo {photo_id}")
@@ -283,45 +300,60 @@ def create_replication_task(
     target_store_id: str,
     target_store_url: str,
     priority: TaskPriority
-) -> ReplicationTask:
-    """Create a new replication task"""
+) -> Optional[ReplicationTask]:
+    """
+    Create a new replication task
+    FIX: Deduplication - check if task already exists
+    """
     
-    task_id = f"repl-{photo_id[:8]}-{target_store_id}-{int(time.time() * 1000)}"
-    
-    task = ReplicationTask(
-        task_id=task_id,
-        photo_id=photo_id,
-        source_store_id=source_store_id,
-        source_store_url=source_store_url,
-        source_volume_id=source_volume_id,
-        target_store_id=target_store_id,
-        target_store_url=target_store_url,
-        priority=priority.value,
-        created_at=time.time()
-    )
+    # FIX: Check for duplicate task
+    task_key = f"{photo_id}:{target_store_id}"
     
     with replication_state.tasks_lock:
+        if task_key in replication_state.pending_task_keys:
+            logger.info(f"Skipping duplicate task: {photo_id[:16]}... -> {target_store_id}")
+            return None
+        
+        task_id = f"repl-{photo_id[:8]}-{target_store_id}-{int(time.time() * 1000)}"
+        
+        task = ReplicationTask(
+            task_id=task_id,
+            photo_id=photo_id,
+            source_store_id=source_store_id,
+            source_store_url=source_store_url,
+            source_volume_id=source_volume_id,
+            target_store_id=target_store_id,
+            target_store_url=target_store_url,
+            priority=priority.value,
+            created_at=time.time()
+        )
+        
         replication_state.tasks[task_id] = task
         replication_state.task_queue.put((priority.value, task_id))
+        replication_state.pending_task_keys.add(task_key)
     
-    logger.info(f"Created task {task_id}: {photo_id} {source_store_id}→{target_store_id} (priority: {priority.name})")
+    logger.info(f"Created task {task_id}: {photo_id[:16]}... {source_store_id}→{target_store_id}")
     
     return task
 
 
 def execute_replication_task(task: ReplicationTask) -> bool:
     """Execute a single replication task"""
-    logger.info(f"Executing {task.task_id}: replicating {task.photo_id} from {task.source_store_id} to {task.target_store_id}")
+    logger.info(f"Executing {task.task_id}: replicating {task.photo_id[:16]}... from {task.source_store_id} to {task.target_store_id}")
     
     try:
         with replication_state.tasks_lock:
             task.status = TaskStatus.IN_PROGRESS.value
             task.last_attempt = time.time()
         
+        # FIX: Add request ID for tracing
+        request_id = str(uuid.uuid4())
+        
         replicate_request = {
             'photo_id': task.photo_id,
             'source_store_url': task.source_store_url,
-            'source_volume_id': task.source_volume_id
+            'source_volume_id': task.source_volume_id,
+            'request_id': request_id
         }
         
         response = requests.post(
@@ -334,9 +366,10 @@ def execute_replication_task(task: ReplicationTask) -> bool:
             raise Exception(f"Replication failed with status {response.status_code}: {response.text}")
         
         result = response.json()
-        logger.info(f"Successfully replicated {task.photo_id} to {task.target_store_id}")
+        logger.info(f"Successfully replicated {task.photo_id[:16]}... to {task.target_store_id}")
         
-        # Register the new location with Directory
+        # Register the new location with Directory (via leader)
+        leader_url = get_leader_url()
         register_request = {
             'photo_id': task.photo_id,
             'store_id': result['store_id'],
@@ -344,7 +377,7 @@ def execute_replication_task(task: ReplicationTask) -> bool:
         }
         
         response = requests.post(
-            f"{DIRECTORY_SERVICE_URL}/register",
+            f"{leader_url}/register",
             json=register_request,
             timeout=10
         )
@@ -352,19 +385,30 @@ def execute_replication_task(task: ReplicationTask) -> bool:
         if response.status_code != 200:
             logger.error(f"Failed to register replica with directory: {response.status_code}")
         else:
-            logger.info(f"Registered new replica location for {task.photo_id}")
+            logger.info(f"Registered new replica location for {task.photo_id[:16]}...")
         
         with replication_state.tasks_lock:
             task.status = TaskStatus.COMPLETED.value
+            task_key = f"{task.photo_id}:{task.target_store_id}"
+            replication_state.pending_task_keys.discard(task_key)
         
         with replication_state.metrics_lock:
             replication_state.total_replications_completed += 1
+        
+        # FIX: Reset failure count on success
+        with replication_state.failed_stores_lock:
+            if task.target_store_id in replication_state.failed_stores:
+                replication_state.failed_stores[task.target_store_id] = 0
         
         logger.info(f"✓ Task {task.task_id} completed successfully")
         return True
         
     except Exception as e:
         logger.error(f"✗ Task {task.task_id} failed: {e}", exc_info=True)
+        
+        # FIX: Track failed stores
+        with replication_state.failed_stores_lock:
+            replication_state.failed_stores[task.target_store_id] += 1
         
         with replication_state.tasks_lock:
             task.status = TaskStatus.FAILED.value
@@ -374,7 +418,7 @@ def execute_replication_task(task: ReplicationTask) -> bool:
         with replication_state.metrics_lock:
             replication_state.total_replications_failed += 1
         
-        # Retry logic
+        # Retry logic with exponential backoff
         if task.retry_count < 3:
             delay = 2 ** task.retry_count
             logger.info(f"Will retry task {task.task_id} in {delay}s (attempt {task.retry_count + 1}/3)")
@@ -388,15 +432,17 @@ def execute_replication_task(task: ReplicationTask) -> bool:
                 task.status = TaskStatus.PENDING.value
         else:
             logger.error(f"Task {task.task_id} failed after {task.retry_count} retries")
+            # Remove from pending keys so it can be retried manually
+            with replication_state.tasks_lock:
+                task_key = f"{task.photo_id}:{task.target_store_id}"
+                replication_state.pending_task_keys.discard(task_key)
         
         return False
 
 
 def execute_dereplication(photo_id: str, store_id: str, store_url: str) -> bool:
-    """
-    IMPROVEMENT #13: Execute de-replication task
-    """
-    logger.info(f"De-replicating {photo_id} from {store_id}")
+    """Execute de-replication task"""
+    logger.info(f"De-replicating {photo_id[:16]}... from {store_id}")
     
     try:
         # Delete from store
@@ -408,9 +454,10 @@ def execute_dereplication(photo_id: str, store_id: str, store_url: str) -> bool:
         if response.status_code not in [200, 404]:
             raise Exception(f"Delete failed with status {response.status_code}")
         
-        # Update directory to remove this replica
+        # Update directory to remove this replica (via leader)
+        leader_url = get_leader_url()
         response = requests.post(
-            f"{DIRECTORY_SERVICE_URL}/internal/remove_replica",
+            f"{leader_url}/internal/remove_replica",
             json={'photo_id': photo_id, 'store_id': store_id},
             timeout=10
         )
@@ -421,7 +468,7 @@ def execute_dereplication(photo_id: str, store_id: str, store_url: str) -> bool:
         with replication_state.metrics_lock:
             replication_state.total_dereplication_completed += 1
         
-        logger.info(f"✓ De-replicated {photo_id} from {store_id}")
+        logger.info(f"✓ De-replicated {photo_id[:16]}... from {store_id}")
         return True
         
     except Exception as e:
@@ -434,13 +481,15 @@ def execute_dereplication(photo_id: str, store_id: str, store_url: str) -> bool:
 def get_photo_locations(photo_id: str) -> List[dict]:
     """
     Get all locations where a photo is stored
-    IMPROVEMENT: Always queries through Nginx which routes to leader/followers
+    FIX: Always queries leader directly for consistency
     """
     try:
-        logger.debug(f"→ Fetching locations for photo {photo_id[:16]}...")
+        leader_url = get_leader_url()
+        
+        logger.debug(f"→ Fetching locations for photo {photo_id[:16]}... from leader")
         
         response = requests.get(
-            f"{DIRECTORY_SERVICE_URL}/locate/{photo_id}",
+            f"{leader_url}/locate/{photo_id}",
             timeout=10
         )
         
@@ -481,26 +530,22 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
         if access_stats:
             if access_stats.access_rate_per_minute >= HIGH_ACCESS_THRESHOLD:
                 target_replica_count = min(MAX_REPLICA_COUNT, DEFAULT_REPLICA_COUNT + 2)
-                logger.info(f"  ✓ Very hot photo ({access_stats.access_rate_per_minute:.1f} req/min), "
-                          f"increasing target to {target_replica_count}")
+                logger.info(f"  ✓ Very hot photo ({access_stats.access_rate_per_minute:.1f} req/min), target: {target_replica_count}")
             elif access_stats.access_rate_per_minute >= ACCESS_RATE_THRESHOLD:
                 target_replica_count = min(MAX_REPLICA_COUNT, DEFAULT_REPLICA_COUNT + 1)
-                logger.info(f"  ✓ Hot photo ({access_stats.access_rate_per_minute:.1f} req/min), "
-                          f"increasing target to {target_replica_count}")
+                logger.info(f"  ✓ Hot photo ({access_stats.access_rate_per_minute:.1f} req/min), target: {target_replica_count}")
         
         replicas_needed = target_replica_count - current_replica_count
         
         if replicas_needed > 0:
-            # Need more replicas
-            logger.info(f"  → Photo {photo_id[:16]}... needs {replicas_needed} more replica(s) "
-                       f"(current: {current_replica_count}, target: {target_replica_count})")
+            logger.info(f"  → Photo {photo_id[:16]}... needs {replicas_needed} more replica(s)")
             
             if current_replica_count == 1:
                 priority = TaskPriority.URGENT
                 logger.warning(f"  ⚠ URGENT: Only 1 replica exists!")
             elif current_replica_count < MIN_REPLICA_COUNT:
                 priority = TaskPriority.HIGH
-                logger.warning(f"  ⚠ HIGH: Below minimum replica count ({MIN_REPLICA_COUNT})")
+                logger.warning(f"  ⚠ HIGH: Below minimum replica count")
             elif access_stats and access_stats.access_rate_per_minute >= HIGH_ACCESS_THRESHOLD:
                 priority = TaskPriority.HIGH
             elif current_replica_count < DEFAULT_REPLICA_COUNT:
@@ -509,20 +554,18 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
                 priority = TaskPriority.LOW
             
             existing_store_ids = {loc['store_id'] for loc in locations}
-            logger.debug(f"  Existing stores: {existing_store_ids}")
             
             for i in range(replicas_needed):
                 source = locations[0]
                 target_store = select_target_store(photo_id, existing_store_ids)
                 
                 if not target_store:
-                    logger.warning(f"  ✗ Cannot create replica {i+1}/{replicas_needed} for {photo_id[:16]}...: no available target store")
+                    logger.warning(f"  ✗ Cannot create replica {i+1}/{replicas_needed}: no target store")
                     break
                 
-                logger.info(f"  → Creating replication task {i+1}/{replicas_needed}: "
-                          f"{source['store_id']} → {target_store['store_id']} (priority: {priority.name})")
+                logger.info(f"  → Creating replication task {i+1}/{replicas_needed}: {source['store_id']} → {target_store['store_id']}")
                 
-                create_replication_task(
+                task = create_replication_task(
                     photo_id=photo_id,
                     source_store_id=source['store_id'],
                     source_store_url=source['store_url'],
@@ -532,13 +575,12 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
                     priority=priority
                 )
                 
-                existing_store_ids.add(target_store['store_id'])
+                if task:
+                    existing_store_ids.add(target_store['store_id'])
         
         elif replicas_needed < 0:
-            # IMPROVEMENT #13: De-replication
             excess_count = abs(replicas_needed)
-            logger.info(f"  → Photo {photo_id[:16]}... has {excess_count} excess replica(s) "
-                       f"(current: {current_replica_count}, target: {target_replica_count})")
+            logger.info(f"  → Photo {photo_id[:16]}... has {excess_count} excess replica(s)")
             
             # Get store capacities
             store_capacities = {}
@@ -558,20 +600,19 @@ def analyze_replication_needs(photo_id: str, access_stats: Optional[PhotoAccessS
             for i in range(min(excess_count, len(sorted_locations) - MIN_REPLICA_COUNT)):
                 loc_to_remove = sorted_locations[i]
                 
-                logger.info(f"  → Scheduling de-replication {i+1}/{excess_count}: "
-                          f"remove {photo_id[:16]}... from {loc_to_remove['store_id']}")
+                logger.info(f"  → Scheduling de-replication {i+1}/{excess_count}: remove from {loc_to_remove['store_id']}")
                 
-                # Execute de-replication in background
                 threading.Thread(
                     target=execute_dereplication,
                     args=(photo_id, loc_to_remove['store_id'], loc_to_remove['store_url']),
                     daemon=True
                 ).start()
         else:
-            logger.debug(f"  ✓ Photo {photo_id[:16]}... has optimal replica count ({current_replica_count})")
+            logger.debug(f"  ✓ Photo {photo_id[:16]}... has optimal replica count")
         
     except Exception as e:
         logger.error(f"✗ Error analyzing replication needs for {photo_id[:16]}...: {e}", exc_info=True)
+
 
 # Background workers
 
@@ -624,7 +665,7 @@ def stats_analyzer_worker():
                 try:
                     analyze_replication_needs(photo_id, stats)
                 except Exception as e:
-                    logger.error(f"Error analyzing {photo_id}: {e}", exc_info=True)
+                    logger.error(f"Error analyzing {photo_id[:16]}...: {e}", exc_info=True)
             
             # Reset stats for next window
             with replication_state.access_stats_lock:
@@ -669,16 +710,16 @@ def monitoring_worker():
                     replica_count = len(locations)
                     
                     if replica_count < MIN_REPLICA_COUNT:
-                        logger.warning(f"Photo {photo_id} under-replicated: {replica_count}/{MIN_REPLICA_COUNT}")
+                        logger.warning(f"Photo {photo_id[:16]}... under-replicated: {replica_count}/{MIN_REPLICA_COUNT}")
                         analyze_replication_needs(photo_id, None)
                         under_replicated_count += 1
                     elif replica_count < DEFAULT_REPLICA_COUNT:
-                        logger.info(f"Photo {photo_id} below target: {replica_count}/{DEFAULT_REPLICA_COUNT}")
+                        logger.info(f"Photo {photo_id[:16]}... below target: {replica_count}/{DEFAULT_REPLICA_COUNT}")
                         analyze_replication_needs(photo_id, None)
                         under_replicated_count += 1
                     
                 except Exception as e:
-                    logger.error(f"Error monitoring {photo_id}: {e}", exc_info=True)
+                    logger.error(f"Error monitoring {photo_id[:16]}...: {e}", exc_info=True)
             
             if under_replicated_count > 0:
                 logger.info(f"Found {under_replicated_count} under-replicated photos")
@@ -690,14 +731,11 @@ def monitoring_worker():
 
 
 def nightly_audit_worker():
-    """
-    IMPROVEMENT #4: Full scan of all photos (nightly at 2 AM)
-    """
+    """Full scan of all photos (nightly at 2 AM)"""
     logger.info(f"Nightly audit worker started (runs at {NIGHTLY_AUDIT_HOUR}:00)")
     
     while True:
         try:
-            # Calculate seconds until next audit time
             now = datetime.now()
             target = now.replace(hour=NIGHTLY_AUDIT_HOUR, minute=0, second=0, microsecond=0)
             
@@ -713,6 +751,9 @@ def nightly_audit_worker():
             logger.info("Starting NIGHTLY FULL AUDIT of all photos")
             logger.info("=" * 80)
             
+            # FIX: Query leader directly
+            leader_url = get_leader_url()
+            
             offset = 0
             limit = 1000
             total_checked = 0
@@ -721,7 +762,7 @@ def nightly_audit_worker():
             while True:
                 try:
                     response = requests.get(
-                        f"{DIRECTORY_SERVICE_URL}/photos/list",
+                        f"{leader_url}/photos/list",
                         params={'offset': offset, 'limit': limit},
                         timeout=30
                     )
@@ -744,14 +785,11 @@ def nightly_audit_worker():
                         total_checked += 1
                         
                         if replica_count < MIN_REPLICA_COUNT:
-                            logger.warning(
-                                f"AUDIT ALERT: {photo_id} has only {replica_count} replica(s)! "
-                                f"(target: {target_replicas})"
-                            )
+                            logger.warning(f"AUDIT ALERT: {photo_id[:16]}... has only {replica_count} replica(s)!")
                             analyze_replication_needs(photo_id, None)
                             under_replicated += 1
                         elif replica_count < target_replicas:
-                            logger.info(f"AUDIT: {photo_id} below target ({replica_count}/{target_replicas})")
+                            logger.info(f"AUDIT: {photo_id[:16]}... below target ({replica_count}/{target_replicas})")
                             analyze_replication_needs(photo_id, None)
                             under_replicated += 1
                     
@@ -760,7 +798,7 @@ def nightly_audit_worker():
                     if offset >= total:
                         break
                     
-                    time.sleep(1)  # Small delay between batches
+                    time.sleep(1)
                     
                 except Exception as e:
                     logger.error(f"Error in audit batch: {e}", exc_info=True)
@@ -774,13 +812,11 @@ def nightly_audit_worker():
             
         except Exception as e:
             logger.error(f"Error in nightly audit worker: {e}", exc_info=True)
-            time.sleep(3600)  # Wait 1 hour before retry
+            time.sleep(3600)
 
 
 def store_info_updater():
-    """
-    IMPROVEMENT #11: Periodically update store information cache
-    """
+    """Periodically update store information cache"""
     logger.info("Store info updater started")
     
     while True:
@@ -804,7 +840,7 @@ def persistence_worker():
             logger.error(f"Error in persistence worker: {e}", exc_info=True)
 
 
-# Lifespan Manager (Replaces on_event)
+# Lifespan Manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize background tasks and clean up on shutdown"""
@@ -815,10 +851,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  - Directory Service: {DIRECTORY_SERVICE_URL}")
     logger.info(f"  - Default Replica Count: {DEFAULT_REPLICA_COUNT}")
     logger.info(f"  - Min/Max Replica Count: {MIN_REPLICA_COUNT}/{MAX_REPLICA_COUNT}")
-    logger.info(f"  - Access Rate Threshold: {ACCESS_RATE_THRESHOLD} req/min")
     logger.info(f"  - Worker Threads: {WORKER_THREAD_COUNT}")
-    logger.info(f"  - Stats Collection Interval: {STATS_COLLECTION_INTERVAL}s")
-    logger.info(f"  - Nightly Audit Hour: {NIGHTLY_AUDIT_HOUR}:00")
     
     load_task_queue()
     
@@ -848,7 +881,6 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
     logger.info("Shutting down Replication Manager")
     save_task_queue()
     logger.info("✓ Replication Manager shut down")
@@ -906,7 +938,7 @@ async def trigger_replication(request: dict):
     try:
         photo_id = request['photo_id']
         
-        logger.info(f"Replication triggered for {photo_id}")
+        logger.info(f"Replication triggered for {photo_id[:16]}...")
         
         threading.Thread(
             target=analyze_replication_needs,
@@ -933,7 +965,9 @@ async def get_replication_status(photo_id: str):
                     'task_id': task.task_id,
                     'target_store_id': task.target_store_id,
                     'status': task.status,
-                    'priority': task.priority
+                    'priority': task.priority,
+                    'retry_count': task.retry_count,
+                    'error_message': task.error_message
                 }
                 for task in replication_state.tasks.values()
                 if task.photo_id == photo_id and task.status in [TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value]
@@ -967,6 +1001,9 @@ async def get_stats():
     with replication_state.tasks_lock:
         pending_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.PENDING.value])
         in_progress_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.IN_PROGRESS.value])
+        
+        # FIX: Add failed store info
+        failed_count = len([t for t in replication_state.tasks.values() if t.status == TaskStatus.FAILED.value])
     
     with replication_state.access_stats_lock:
         photos_tracked = len(replication_state.access_stats)
@@ -977,12 +1014,16 @@ async def get_stats():
         failed = replication_state.total_replications_failed
         derepli = replication_state.total_dereplication_completed
     
+    with replication_state.failed_stores_lock:
+        failed_stores = dict(replication_state.failed_stores)
+    
     return {
         'tasks': {
             'pending': pending_count,
             'in_progress': in_progress_count,
             'completed': completed,
-            'failed': failed,
+            'failed': failed_count,
+            'total_failed': failed,
             'dereplicated': derepli,
             'queue_depth': replication_state.task_queue.qsize()
         },
@@ -990,6 +1031,7 @@ async def get_stats():
             'photos_tracked': photos_tracked,
             'hot_photos': hot_photos
         },
+        'failed_stores': failed_stores,
         'configuration': {
             'default_replica_count': DEFAULT_REPLICA_COUNT,
             'min_replica_count': MIN_REPLICA_COUNT,

@@ -1,15 +1,10 @@
 """
-Directory Service - Manages photo location mappings and store registry
-IMPROVEMENTS:
-- Issue #2: Redis-based leader election
-- Issue #3: Health-aware location filtering
-- Issue #4: Full photo listing for cold data monitoring
-- Issue #8: Push notifications to followers
-- Issue #11: Dynamic store discovery endpoint
-- Issue #16: SHA256 checksums at directory level
-- CRITICAL FIX: Heartbeat replication and snapshot grace period
-- FIX: Migrated to lifespan events
-- FIX: Expose Leader URL in stats for smart routing
+Directory Service - FIXED VERSION
+Critical fixes:
+1. All read endpoints forward to leader for consistency
+2. Synchronous follower notification for critical operations
+3. WAL replay idempotency check
+4. Enhanced logging for debugging
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,11 +26,12 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict
 from enum import Enum
 import redis
+import uuid
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] %(message)s'
 )
 logger = logging.getLogger("DirectoryService")
 
@@ -88,7 +84,6 @@ class StoreInfo:
 
 @dataclass
 class PhotoMetadata:
-    """IMPROVEMENT #16: Added checksum and size"""
     photo_id: str
     replicas: List[PhotoLocation]
     target_replica_count: int
@@ -98,7 +93,6 @@ class PhotoMetadata:
 
 
 class LeadershipState:
-    """Tracks leadership information"""
     def __init__(self):
         self.is_leader = False
         self.current_leader_id = None
@@ -108,13 +102,13 @@ class LeadershipState:
 
 
 class DirectoryState:
-    """Manages the directory's core state"""
     def __init__(self):
         self.photos: Dict[str, PhotoMetadata] = {}
         self.stores: Dict[str, StoreInfo] = {}
         self.lock = threading.RLock()
         self.write_ahead_log: List[dict] = []
         self.log_index = 0
+        self.applied_operations: set = set()  # FIX: Track applied ops for idempotency
         self.followers = []
 
 
@@ -140,8 +134,6 @@ def discover_followers():
 # Redis-based leader election
 
 class RedisLeaderElection:
-    """Redis-based leader election using SET NX with TTL"""
-    
     def __init__(self, redis_client, ttl=10):
         self.redis = redis_client
         self.ttl = ttl
@@ -149,7 +141,6 @@ class RedisLeaderElection:
         self.term_key = "haystack:leader:term"
     
     def get_next_term(self) -> int:
-        """Get next term number"""
         try:
             current_term = self.redis.get(self.term_key)
             if current_term:
@@ -159,7 +150,6 @@ class RedisLeaderElection:
             return 1
     
     def try_claim_leadership(self, instance_id: str, instance_url: str) -> bool:
-        """Attempt to claim leadership atomically"""
         try:
             term = self.get_next_term()
             
@@ -188,7 +178,6 @@ class RedisLeaderElection:
             return False
     
     def maintain_leadership(self, instance_id: str) -> bool:
-        """Refresh TTL if still leader"""
         try:
             current = self.redis.get(self.lock_key)
             if current:
@@ -203,7 +192,6 @@ class RedisLeaderElection:
             return False
     
     def read_leadership(self) -> Optional[dict]:
-        """Read current leadership record"""
         try:
             current = self.redis.get(self.lock_key)
             if current:
@@ -259,10 +247,7 @@ def save_snapshot():
 
 
 def load_snapshot():
-    """
-    Load directory state from disk
-    CRITICAL FIX: Reset last_heartbeat timestamps to prevent "death on restart"
-    """
+    """Load directory state from disk with grace period for stores"""
     try:
         snapshot_path = os.path.join(DATA_DIRECTORY, 'snapshot.json')
         
@@ -289,30 +274,31 @@ def load_snapshot():
                     size_bytes=photo_data.get('size_bytes')
                 )
             
-            # Load stores with GRACE PERIOD
+            # Load stores with grace period
             current_time = int(time.time())
             for store_id, store_data in snapshot.get('stores', {}).items():
-                # CRITICAL FIX: Reset last_heartbeat to current time
-                # This gives stores a grace period to check in before being marked DOWN
                 store_data['last_heartbeat'] = current_time
                 store_data['status'] = ServiceStatus.HEALTHY.value
                 directory_state.stores[store_id] = StoreInfo(**store_data)
-                logger.info(f"  ✓ Loaded store {store_id} with grace period (last_heartbeat reset to now)")
             
             directory_state.log_index = snapshot.get('log_index', 0)
         
-        logger.info(f"✓ Snapshot loaded: {len(directory_state.photos)} photos, {len(directory_state.stores)} stores (all given 90s grace period)")
+        logger.info(f"✓ Snapshot loaded: {len(directory_state.photos)} photos, {len(directory_state.stores)} stores")
         
     except Exception as e:
         logger.error(f"✗ Error loading snapshot: {e}")
 
 
 def append_to_wal(operation: dict):
-    """Append operation to write-ahead log"""
+    """Append operation to write-ahead log with operation ID"""
     try:
         os.makedirs(DATA_DIRECTORY, exist_ok=True)
         
         wal_path = os.path.join(DATA_DIRECTORY, 'wal.jsonl')
+        
+        # FIX: Add unique operation ID for idempotency
+        if 'operation_id' not in operation:
+            operation['operation_id'] = str(uuid.uuid4())
         
         with open(wal_path, 'a') as f:
             operation['log_index'] = directory_state.log_index
@@ -328,28 +314,43 @@ def append_to_wal(operation: dict):
 
 
 def load_wal():
-    """Load and replay write-ahead log"""
+    """Load and replay write-ahead log with idempotency check"""
     try:
         wal_path = os.path.join(DATA_DIRECTORY, 'wal.jsonl')
         
         if not os.path.exists(wal_path):
             return
         
+        # FIX: Only replay operations after snapshot index
+        snapshot_index = directory_state.log_index
+        
         with open(wal_path, 'r') as f:
             for line in f:
                 if line.strip():
                     operation = json.loads(line)
+                    op_index = operation.get('log_index', 0)
+                    
+                    # Skip operations already in snapshot
+                    if op_index < snapshot_index:
+                        continue
+                    
                     apply_operation(operation, from_wal=True)
         
-        logger.info(f"✓ Replayed WAL to log index {directory_state.log_index}")
+        logger.info(f"✓ Replayed WAL from index {snapshot_index} to {directory_state.log_index}")
         
     except Exception as e:
         logger.error(f"✗ Error loading WAL: {e}")
 
 
 def apply_operation(operation: dict, from_wal: bool = False):
-    """Apply an operation to the directory state"""
+    """Apply an operation to the directory state with idempotency"""
     try:
+        # FIX: Check if operation already applied
+        op_id = operation.get('operation_id')
+        if op_id and op_id in directory_state.applied_operations:
+            logger.debug(f"Skipping duplicate operation {op_id}")
+            return
+        
         op_type = operation['type']
         
         if op_type == 'register_photo':
@@ -369,6 +370,7 @@ def apply_operation(operation: dict, from_wal: bool = False):
                         size_bytes=operation.get('size_bytes')
                     )
                 
+                # Check for duplicate replica
                 existing = [
                     loc for loc in directory_state.photos[photo_id].replicas 
                     if loc.store_id == store_id and loc.volume_id == volume_id
@@ -406,28 +408,69 @@ def apply_operation(operation: dict, from_wal: bool = False):
                     logger.info(f"✓ Removed replica {photo_id[:16]}... from {store_id}")
         
         elif op_type == 'heartbeat':
-            # CRITICAL FIX: Heartbeat replication
             store_id = operation['store_id']
             available_capacity = operation.get('available_capacity')
             
             with directory_state.lock:
                 if store_id in directory_state.stores:
                     store = directory_state.stores[store_id]
-                    old_heartbeat = store.last_heartbeat
                     store.last_heartbeat = int(time.time())
                     if available_capacity is not None:
                         store.available_capacity = available_capacity
                     store.status = ServiceStatus.HEALTHY.value
-                    
-                    logger.debug(f"♥ Heartbeat from {store_id} (was {time.time() - old_heartbeat:.1f}s ago, now fresh)")
+        
+        # Mark operation as applied
+        if op_id:
+            directory_state.applied_operations.add(op_id)
         
     except Exception as e:
         logger.error(f"✗ Error applying operation: {e}")
 
 
-# Push notifications to followers
+# FIX: Synchronous notification for critical operations
+def notify_followers_sync(operation: dict, timeout: float = 2.0):
+    """
+    Synchronously notify followers about critical operations
+    Returns True if majority of followers acknowledged
+    """
+    if not directory_state.followers:
+        return True
+    
+    success_count = 0
+    threads = []
+    results = {}
+    
+    def notify_single(follower_url: str):
+        try:
+            response = requests.post(
+                f"{follower_url}/internal/sync",
+                json={'operations': [operation]},
+                timeout=timeout
+            )
+            results[follower_url] = (response.status_code == 200)
+        except Exception as e:
+            logger.warning(f"Failed to notify {follower_url}: {e}")
+            results[follower_url] = False
+    
+    for follower_url in directory_state.followers:
+        thread = threading.Thread(target=notify_single, args=(follower_url,))
+        thread.start()
+        threads.append(thread)
+    
+    for thread in threads:
+        thread.join(timeout=timeout)
+    
+    success_count = sum(1 for success in results.values() if success)
+    majority = len(directory_state.followers) // 2 + 1
+    
+    logger.info(f"Follower sync: {success_count}/{len(directory_state.followers)} succeeded")
+    
+    return success_count >= majority
+
+
+# Push notifications to followers (async for non-critical)
 def notify_followers(operation: dict):
-    """Non-blocking notification to followers about new operation"""
+    """Non-blocking notification to followers"""
     for follower_url in directory_state.followers:
         threading.Thread(
             target=lambda url=follower_url: _send_sync_notification(url, operation),
@@ -445,10 +488,33 @@ def _send_sync_notification(follower_url: str, operation: dict):
         )
         if response.status_code == 200:
             logger.debug(f"✓ Synced to {follower_url}")
-        else:
-            logger.debug(f"✗ Failed to sync to {follower_url}: {response.status_code}")
     except Exception as e:
         logger.debug(f"✗ Failed to notify {follower_url}: {e}")
+
+
+# Helper function to forward to leader
+def forward_to_leader(path: str, method: str = "GET", json_data: dict = None, timeout: int = 10):
+    """
+    FIX: Centralized function to forward requests to leader
+    """
+    leader_url = get_leader_url()
+    if not leader_url:
+        return None
+    
+    try:
+        if method == "GET":
+            response = requests.get(f"{leader_url}{path}", timeout=timeout)
+        elif method == "POST":
+            response = requests.post(f"{leader_url}{path}", json=json_data, timeout=timeout)
+        elif method == "DELETE":
+            response = requests.delete(f"{leader_url}{path}", timeout=timeout)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error forwarding to leader: {e}")
+        raise HTTPException(status_code=503, detail="Leader unavailable")
 
 
 # Leader Election functions
@@ -549,7 +615,7 @@ def select_store_for_write() -> Optional[StoreInfo]:
             return None
         
         selected = max(available_stores, key=lambda s: s.available_capacity)
-        logger.info(f"✓ Selected {selected.store_id} for write (capacity: {selected.available_capacity/1e9:.2f}GB)")
+        logger.info(f"✓ Selected {selected.store_id} for write")
         return selected
 
 
@@ -576,10 +642,7 @@ def leader_election_worker():
 
 
 def follower_sync_worker():
-    """
-    IMPROVEMENT #8: Faster sync (0.5s instead of 5s)
-    Sync state from leader (for followers)
-    """
+    """Sync state from leader (for followers)"""
     logger.info("✓ Follower sync worker started")
     last_synced_index = 0
     
@@ -631,10 +694,7 @@ def snapshot_worker():
 
 
 def store_health_monitor():
-    """
-    Monitor store health and mark unhealthy stores
-    FIXED: More lenient thresholds to prevent false positives
-    """
+    """Monitor store health and mark unhealthy stores"""
     logger.info("✓ Store health monitor started")
     
     while True:
@@ -648,59 +708,49 @@ def store_health_monitor():
                     time_since_heartbeat = current_time - store.last_heartbeat
                     old_status = store.status
                     
-                    # DOWN: No heartbeat for 90+ seconds (3x heartbeat interval)
                     if time_since_heartbeat > 90:
                         if store.status != ServiceStatus.DOWN.value:
                             store.status = ServiceStatus.DOWN.value
-                            logger.warning(f"⚠ Store {store.store_id} marked as DOWN (no heartbeat for {time_since_heartbeat}s)")
-                    # DEGRADED: No heartbeat for 60+ seconds (2x heartbeat interval)
+                            logger.warning(f"⚠ Store {store.store_id} marked as DOWN")
                     elif time_since_heartbeat > 60:
                         if store.status != ServiceStatus.DEGRADED.value:
                             store.status = ServiceStatus.DEGRADED.value
-                            logger.warning(f"⚠ Store {store.store_id} marked as DEGRADED (no heartbeat for {time_since_heartbeat}s)")
-                    # HEALTHY: Recent heartbeat
+                            logger.warning(f"⚠ Store {store.store_id} marked as DEGRADED")
                     else:
                         if store.status != ServiceStatus.HEALTHY.value:
-                            if old_status != ServiceStatus.HEALTHY.value:
-                                logger.info(f"✓ Store {store.store_id} marked as HEALTHY (heartbeat {time_since_heartbeat}s ago)")
                             store.status = ServiceStatus.HEALTHY.value
+                            logger.info(f"✓ Store {store.store_id} marked as HEALTHY")
             
         except Exception as e:
             logger.error(f"✗ Error in store health monitor: {e}")
 
-# Lifespan Manager (Replaces on_event)
+
+# Lifespan Manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize background tasks and clean up on shutdown"""
-    # Startup
     logger.info("=" * 80)
     logger.info(f"🚀 Starting Directory Service: {INSTANCE_ID}")
     logger.info("=" * 80)
     
-    # Discover peer instances
     discover_followers()
-    
-    # Load persisted state
     load_snapshot()
     load_wal()
     
-    # Start leader election
     check_leadership()
     if not leadership_state.current_leader_id:
         try_claim_leadership()
     
-    # Start background workers
     threading.Thread(target=leader_election_worker, daemon=True, name="LeaderElection").start()
     threading.Thread(target=follower_sync_worker, daemon=True, name="FollowerSync").start()
     threading.Thread(target=snapshot_worker, daemon=True, name="Snapshot").start()
     threading.Thread(target=store_health_monitor, daemon=True, name="HealthMonitor").start()
     
-    logger.info(f"✓ Background workers started")
     logger.info(f"✓ Directory Service ready. Leader: {leadership_state.is_leader}")
+    logger.info("=" * 80)
     
     yield
     
-    # Shutdown
     if leadership_state.is_leader:
         save_snapshot()
     logger.info("Directory Service shutting down")
@@ -708,7 +758,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Directory Service", lifespan=lifespan)
 
-# Rate limiting setup
+limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -721,20 +771,11 @@ async def allocate_write(request: Request):
     """Allocate a store for writing a new photo"""
     req_data = await request.json()
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
         logger.info(f"→ Forwarding /allocate to leader at {leader_url}")
-        try:
-            response = requests.post(
-                f"{leader_url}/allocate",
-                json=req_data,
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        response = forward_to_leader("/allocate", method="POST", json_data=req_data)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         photo_id = req_data.get('photo_id')
@@ -767,20 +808,11 @@ async def register_photo(request: Request):
     """Register a photo location after successful write"""
     req_data = await request.json()
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
         logger.info(f"→ Forwarding /register to leader at {leader_url}")
-        try:
-            response = requests.post(
-                f"{leader_url}/register",
-                json=req_data,
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        response = forward_to_leader("/register", method="POST", json_data=req_data)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         photo_id = req_data['photo_id']
@@ -806,16 +838,16 @@ async def register_photo(request: Request):
             'store_url': store_url,
             'volume_id': volume_id,
             'checksum': checksum,
-            'size_bytes': size_bytes
+            'size_bytes': size_bytes,
+            'operation_id': str(uuid.uuid4())
         }
         
         apply_operation(operation)
         append_to_wal(operation)
         
-        # Push notification to followers
+        # FIX: Synchronous notification for critical operations
         if leadership_state.is_leader:
-            notify_followers(operation)
-            logger.debug(f"✓ Notified followers about {photo_id[:16]}...")
+            notify_followers_sync(operation, timeout=2.0)
         
         # Notify Replication Manager
         try:
@@ -839,9 +871,19 @@ async def register_photo(request: Request):
 @app.get("/locate/{photo_id}")
 async def locate_photo(photo_id: str):
     """
-    Get locations where a photo is stored (only accessible stores)
-    Note: DEGRADED stores are included - they're slow but still accessible
+    FIX: Forward to leader for consistent reads
+    Get locations where a photo is stored
     """
+    leader_url = get_leader_url()
+    if leader_url:
+        logger.debug(f"→ Forwarding /locate to leader at {leader_url}")
+        try:
+            response = forward_to_leader(f"/locate/{photo_id}", method="GET")
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except HTTPException:
+            raise
+    
+    # We are the leader
     try:
         logger.debug(f"→ Locating photo {photo_id[:16]}...")
         
@@ -852,7 +894,6 @@ async def locate_photo(photo_id: str):
             
             metadata = directory_state.photos[photo_id]
             
-            # Filter for active replicas on non-DOWN stores
             accessible_locations = []
             for loc in metadata.replicas:
                 if loc.status != 'active':
@@ -893,19 +934,11 @@ async def locate_photo(photo_id: str):
 async def delete_photo(photo_id: str, request: Request):
     """Delete a photo from the system"""
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
         logger.info(f"→ Forwarding /delete to leader at {leader_url}")
-        try:
-            response = requests.delete(
-                f"{leader_url}/delete/{photo_id}",
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        response = forward_to_leader(f"/delete/{photo_id}", method="DELETE")
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         logger.info(f"→ Deleting photo {photo_id[:16]}...")
@@ -918,14 +951,15 @@ async def delete_photo(photo_id: str, request: Request):
         
         operation = {
             'type': 'delete_photo',
-            'photo_id': photo_id
+            'photo_id': photo_id,
+            'operation_id': str(uuid.uuid4())
         }
         
         apply_operation(operation)
         append_to_wal(operation)
         
         if leadership_state.is_leader:
-            notify_followers(operation)
+            notify_followers_sync(operation, timeout=2.0)
         
         # Asynchronously delete from stores
         for loc in locations:
@@ -950,20 +984,11 @@ async def delete_photo(photo_id: str, request: Request):
 async def register_store(request: dict):
     """Register a new store or update existing store"""
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
-        logger.debug(f"→ Forwarding /stores/register to leader at {leader_url}")
-        try:
-            response = requests.post(
-                f"{leader_url}/stores/register",
-                json=request,
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        logger.debug(f"→ Forwarding /stores/register to leader")
+        response = forward_to_leader("/stores/register", method="POST", json_data=request)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         store_id = request['store_id']
@@ -1002,27 +1027,14 @@ async def register_store(request: dict):
 
 @app.post("/stores/heartbeat")
 async def store_heartbeat(request: dict):
-    """
-    CRITICAL FIX: Heartbeat with replication to all directory instances
-    Receive heartbeat from a store and replicate to followers
-    """
+    """Receive heartbeat from a store and replicate to followers"""
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
-        logger.debug(f"→ Forwarding heartbeat from {request.get('store_id')} to leader at {leader_url}")
-        try:
-            response = requests.post(
-                f"{leader_url}/stores/heartbeat",
-                json=request,
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding heartbeat to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        logger.debug(f"→ Forwarding heartbeat to leader")
+        response = forward_to_leader("/stores/heartbeat", method="POST", json_data=request)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
-    # We are the leader - process and replicate
     try:
         store_id = request['store_id']
         available_capacity = request.get('available_capacity')
@@ -1030,27 +1042,25 @@ async def store_heartbeat(request: dict):
         with directory_state.lock:
             if store_id in directory_state.stores:
                 store = directory_state.stores[store_id]
-                old_heartbeat = store.last_heartbeat
                 store.last_heartbeat = int(time.time())
                 if available_capacity is not None:
                     store.available_capacity = available_capacity
                 store.status = ServiceStatus.HEALTHY.value
                 
-                time_since_last = time.time() - old_heartbeat
-                logger.debug(f"♥ Heartbeat from {store_id} (last: {time_since_last:.1f}s ago)")
+                logger.debug(f"♥ Heartbeat from {store_id}")
             else:
                 logger.warning(f"⚠ Heartbeat from unknown store: {store_id}")
                 raise HTTPException(status_code=404, detail="Store not registered")
         
-        # CRITICAL: Replicate heartbeat to all followers
+        # Replicate heartbeat to followers
         if leadership_state.is_leader:
             operation = {
                 'type': 'heartbeat',
                 'store_id': store_id,
-                'available_capacity': available_capacity
+                'available_capacity': available_capacity,
+                'operation_id': str(uuid.uuid4())
             }
             notify_followers(operation)
-            logger.debug(f"♥ Replicated heartbeat from {store_id} to followers")
         
         return {'success': True}
         
@@ -1064,14 +1074,23 @@ async def store_heartbeat(request: dict):
 @app.get("/stores")
 async def list_stores(healthy_only: bool = True):
     """
-    IMPROVEMENT #11: Dynamic store discovery
-    List all registered stores (includes DEGRADED if healthy_only=True)
+    FIX: Forward to leader for consistent reads
+    List all registered stores
     """
+    leader_url = get_leader_url()
+    if leader_url:
+        logger.debug(f"→ Forwarding /stores to leader")
+        try:
+            response = forward_to_leader(f"/stores?healthy_only={healthy_only}", method="GET")
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except HTTPException:
+            raise
+    
+    # We are the leader
     try:
         with directory_state.lock:
             stores = []
             for store in directory_state.stores.values():
-                # If healthy_only, exclude DOWN stores but include DEGRADED
                 if healthy_only and store.status == ServiceStatus.DOWN.value:
                     continue
                 
@@ -1085,8 +1104,6 @@ async def list_stores(healthy_only: bool = True):
                 })
         
         logger.info(f"✓ Returning {len(stores)} stores (healthy_only={healthy_only})")
-        for s in stores:
-            logger.debug(f"  - {s['store_id']}: {s['status']}, heartbeat: {s['last_heartbeat_age']:.1f}s ago")
         
         return {'stores': stores, 'count': len(stores)}
         
@@ -1098,9 +1115,19 @@ async def list_stores(healthy_only: bool = True):
 @app.get("/photos/list")
 async def list_all_photos(offset: int = 0, limit: int = 1000):
     """
-    IMPROVEMENT #4: Full photo listing for cold data monitoring
+    FIX: Forward to leader for consistent reads
     Paginated photo listing for full scans
     """
+    leader_url = get_leader_url()
+    if leader_url:
+        logger.debug(f"→ Forwarding /photos/list to leader")
+        try:
+            response = forward_to_leader(f"/photos/list?offset={offset}&limit={limit}", method="GET")
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except HTTPException:
+            raise
+    
+    # We are the leader
     try:
         with directory_state.lock:
             all_photo_ids = sorted(directory_state.photos.keys())
@@ -1110,7 +1137,6 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
             for photo_id in page:
                 metadata = directory_state.photos[photo_id]
                 
-                # Count accessible replicas (HEALTHY or DEGRADED stores)
                 accessible_count = 0
                 for loc in metadata.replicas:
                     if loc.status != 'active':
@@ -1128,7 +1154,7 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
                     'size_bytes': metadata.size_bytes
                 })
             
-            logger.info(f"✓ Listed {len(photos)} photos (offset={offset}, total={len(all_photo_ids)})")
+            logger.info(f"✓ Listed {len(photos)} photos (offset={offset})")
             
             return {
                 'photos': photos,
@@ -1145,9 +1171,19 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
 @app.post("/verify_photos")
 async def verify_photos(request: dict):
     """
-    IMPROVEMENT #5: Batch photo verification for GC
+    FIX: Forward to leader for consistent reads
     Check if photos are registered
     """
+    leader_url = get_leader_url()
+    if leader_url:
+        logger.debug(f"→ Forwarding /verify_photos to leader")
+        try:
+            response = forward_to_leader("/verify_photos", method="POST", json_data=request)
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except HTTPException:
+            raise
+    
+    # We are the leader
     try:
         photo_ids = request['photo_ids']
         
@@ -1156,7 +1192,7 @@ async def verify_photos(request: dict):
         
         not_found = [pid for pid in photo_ids if pid not in registered]
         
-        logger.debug(f"✓ Verified {len(photo_ids)} photos: {len(photo_ids) - len(not_found)} registered, {len(not_found)} not found")
+        logger.debug(f"✓ Verified {len(photo_ids)} photos: {len(not_found)} not found")
         
         return {
             'requested': len(photo_ids),
@@ -1171,24 +1207,13 @@ async def verify_photos(request: dict):
 
 @app.post("/internal/remove_replica")
 async def remove_replica(request: dict):
-    """
-    IMPROVEMENT #13: Remove a replica (for de-replication)
-    """
+    """Remove a replica (for de-replication)"""
     
-    # Forward to leader if we're a follower
     leader_url = get_leader_url()
     if leader_url:
         logger.debug(f"→ Forwarding /internal/remove_replica to leader")
-        try:
-            response = requests.post(
-                f"{leader_url}/internal/remove_replica",
-                json=request,
-                timeout=10
-            )
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-        except Exception as e:
-            logger.error(f"✗ Error forwarding to leader: {e}")
-            raise HTTPException(status_code=503, detail="Leader unavailable")
+        response = forward_to_leader("/internal/remove_replica", method="POST", json_data=request)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         photo_id = request['photo_id']
@@ -1199,7 +1224,8 @@ async def remove_replica(request: dict):
         operation = {
             'type': 'remove_replica',
             'photo_id': photo_id,
-            'store_id': store_id
+            'store_id': store_id,
+            'operation_id': str(uuid.uuid4())
         }
         
         apply_operation(operation)
@@ -1217,15 +1243,11 @@ async def remove_replica(request: dict):
 
 @app.get("/stats")
 async def get_stats():
-    """
-    Get directory statistics
-    FIX: Returns current_leader_url to help clients find the authority
-    """
+    """Get directory statistics"""
     with directory_state.lock:
         total_photos = len(directory_state.photos)
         total_stores = len(directory_state.stores)
         
-        # Count stores by status
         healthy_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.HEALTHY.value])
         degraded_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.DEGRADED.value])
         down_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.DOWN.value])
@@ -1239,7 +1261,7 @@ async def get_stats():
         'instance_id': INSTANCE_ID,
         'is_leader': leadership_state.is_leader,
         'current_leader': leadership_state.current_leader_id,
-        'current_leader_url': leadership_state.current_leader_url,  # ADDED THIS
+        'current_leader_url': leadership_state.current_leader_url,
         'term_number': leadership_state.term_number,
         'total_photos': total_photos,
         'total_stores': total_stores,
@@ -1263,7 +1285,7 @@ async def health_check():
 
 @app.get("/internal/updates")
 async def get_updates(since_index: int = 0):
-    """Get updates since a specific log index (for followers to sync)"""
+    """Get updates since a specific log index"""
     try:
         updates = []
         
@@ -1288,9 +1310,7 @@ async def get_updates(since_index: int = 0):
 
 @app.post("/internal/sync")
 async def receive_sync(request: dict):
-    """
-    IMPROVEMENT #8: Receive real-time sync from leader
-    """
+    """Receive real-time sync from leader"""
     try:
         operations = request['operations']
         for operation in operations:

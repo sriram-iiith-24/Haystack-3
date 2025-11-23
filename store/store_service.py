@@ -1,10 +1,10 @@
 """
-Store Service - Handles photo storage in volumes with needle-based packing
-IMPROVEMENTS:
-- Issue #1: Tombstone appends for durable deletes
-- Issue #9: Push-on-write to Redis cache
-- Issue #5: Garbage collection for orphaned data
-- Issue #15: Rate limiting
+Store Service - FIXED VERSION
+Critical fixes:
+1. GC queries leader directly for consistent reads
+2. Compaction blocks writes during critical section
+3. Store registration retries indefinitely until successful
+4. Request ID tracking for debugging
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Request
@@ -26,11 +26,12 @@ from collections import defaultdict
 import logging
 import zlib
 import redis
+import uuid
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] %(message)s'
 )
 logger = logging.getLogger("StoreService")
 
@@ -41,7 +42,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Configuration from environment variables
+# Configuration
 STORE_ID = os.getenv("STORE_ID", "store-1")
 STORE_URL = os.getenv("STORE_URL", "http://localhost:8000")
 VOLUME_DIRECTORY = os.getenv("VOLUME_DIRECTORY", "/data/volumes")
@@ -57,7 +58,7 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 30))
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=False)
     redis_client.ping()
-    logger.info("Connected to Redis successfully")
+    logger.info("✓ Connected to Redis successfully")
 except Exception as e:
     logger.warning(f"Redis connection failed: {e}. Cache push disabled.")
     redis_client = None
@@ -68,6 +69,13 @@ volume_lock = threading.RLock()
 access_stats = defaultdict(int)
 access_stats_lock = threading.Lock()
 stats_window_start = time.time()
+
+# FIX: Flag to prevent writes during compaction
+compaction_in_progress = False
+compaction_lock = threading.Lock()
+
+# FIX: Registration success flag
+registration_successful = False
 
 
 class Needle:
@@ -170,14 +178,10 @@ class Volume:
             try:
                 needle, next_offset = Needle.deserialize(file_data, offset)
                 
-                # IMPROVEMENT #1: Handle tombstones during index rebuild
                 if needle.deleted:
-                    # Mark as deleted in index
                     if needle.photo_id in self.index:
                         self.index[needle.photo_id]['deleted'] = True
-                        logger.debug(f"Found tombstone for {needle.photo_id}")
                 else:
-                    # Regular photo
                     self.index[needle.photo_id] = {
                         'offset': offset,
                         'size': needle.size,
@@ -197,9 +201,13 @@ class Volume:
     def write(self, photo_id: str, photo_data: bytes) -> dict:
         """Write a photo to the volume"""
         with self.lock:
-            # Check if photo already exists and is active
+            # FIX: Check if compaction is in progress
+            with compaction_lock:
+                if compaction_in_progress:
+                    raise Exception("Volume compaction in progress, try again")
+            
             if photo_id in self.index and not self.index[photo_id]['deleted']:
-                logger.info(f"Photo {photo_id} already exists in volume {self.volume_id}")
+                logger.info(f"Photo {photo_id[:16]}... already exists in volume {self.volume_id}")
                 return {
                     'photo_id': photo_id,
                     'volume_id': self.volume_id,
@@ -227,7 +235,7 @@ class Volume:
             }
             self.current_size += len(needle_bytes)
             
-            logger.info(f"Wrote photo {photo_id} to {self.volume_id} at offset {offset}")
+            logger.info(f"Wrote photo {photo_id[:16]}... to {self.volume_id}")
             
             return {
                 'photo_id': photo_id,
@@ -255,32 +263,26 @@ class Volume:
                 needle, _ = Needle.deserialize(needle_data)
                 return needle.photo_data
             except Exception as e:
-                logger.error(f"Error reading photo {photo_id}: {e}")
+                logger.error(f"Error reading photo {photo_id[:16]}...: {e}")
                 return None
     
     def delete(self, photo_id: str) -> bool:
-        """
-        IMPROVEMENT #1: Write tombstone to disk for durable delete
-        """
+        """Write tombstone to disk for durable delete"""
         with self.lock:
             if photo_id not in self.index:
                 return False
             
             if self.index[photo_id]['deleted']:
-                return True  # Already deleted
+                return True
             
-            # Create tombstone needle (empty data with deleted flag)
             tombstone = Needle(photo_id, b'', deleted=True)
             tombstone_bytes = tombstone.serialize()
             
-            # Check if we have space for tombstone
             if self.current_size + len(tombstone_bytes) > self.max_size:
-                logger.warning(f"Volume full, cannot write tombstone for {photo_id}")
-                # Mark as deleted in index anyway
+                logger.warning(f"Volume full, cannot write tombstone for {photo_id[:16]}...")
                 self.index[photo_id]['deleted'] = True
                 return True
             
-            # Append tombstone to volume file
             offset = self.current_size
             with open(self.volume_path, 'ab') as f:
                 f.write(tombstone_bytes)
@@ -288,15 +290,13 @@ class Volume:
                 os.fsync(f.fileno())
             
             self.current_size += len(tombstone_bytes)
-            
-            # Update index
             self.index[photo_id]['deleted'] = True
             
-            logger.info(f"Wrote tombstone for {photo_id} at offset {offset}")
+            logger.info(f"Wrote tombstone for {photo_id[:16]}...")
             return True
     
     def get_efficiency(self) -> float:
-        """Calculate volume efficiency (valid bytes / total bytes)"""
+        """Calculate volume efficiency"""
         if self.current_size == 0:
             return 1.0
         
@@ -308,7 +308,7 @@ class Volume:
     
     def compact(self) -> 'Volume':
         """
-        IMPROVEMENT #1: Compaction now skips tombstones
+        FIX: Compaction now properly blocks writes
         """
         logger.info(f"Starting compaction for volume {self.volume_id}")
         
@@ -316,20 +316,30 @@ class Volume:
         new_volume_path = f"{self.volume_path}.new"
         new_volume = Volume(new_volume_id, new_volume_path, self.max_size)
         
-        with self.lock:
-            for photo_id, info in self.index.items():
-                if not info['deleted']:
-                    photo_data = self.read(photo_id)
-                    if photo_data:
-                        new_volume.write(photo_id, photo_data)
+        # FIX: Set compaction flag to block writes
+        global compaction_in_progress
+        with compaction_lock:
+            compaction_in_progress = True
         
-        logger.info(
-            f"Compaction complete. Old: {self.current_size} bytes, "
-            f"New: {new_volume.current_size} bytes, "
-            f"Saved: {self.current_size - new_volume.current_size} bytes"
-        )
-        
-        return new_volume
+        try:
+            with self.lock:
+                for photo_id, info in self.index.items():
+                    if not info['deleted']:
+                        photo_data = self.read(photo_id)
+                        if photo_data:
+                            new_volume.write(photo_id, photo_data)
+            
+            logger.info(
+                f"Compaction complete. Old: {self.current_size} bytes, "
+                f"New: {new_volume.current_size} bytes, "
+                f"Saved: {self.current_size - new_volume.current_size} bytes"
+            )
+            
+            return new_volume
+        finally:
+            # FIX: Always clear compaction flag
+            with compaction_lock:
+                compaction_in_progress = False
     
     def get_all_photo_ids(self) -> List[str]:
         """Get all active photo IDs in this volume"""
@@ -355,6 +365,11 @@ class Volume:
 def get_or_create_volume() -> Volume:
     """Get an available volume or create a new one"""
     with volume_lock:
+        # FIX: Check compaction flag
+        with compaction_lock:
+            if compaction_in_progress:
+                raise HTTPException(status_code=503, detail="Compaction in progress")
+        
         for volume in volumes.values():
             if volume.current_size < volume.max_size * 0.9:
                 return volume
@@ -384,24 +399,36 @@ def initialize_volumes():
 
 
 def push_to_cache(photo_id: str, photo_data: bytes):
-    """
-    IMPROVEMENT #9: Push photo to Redis cache immediately after write
-    """
+    """Push photo to Redis cache immediately after write"""
     if not redis_client:
         return
     
     try:
-        # Store in Redis with 1 hour TTL
         redis_client.setex(f"photo:{photo_id}", 3600, photo_data)
-        logger.debug(f"Pushed {photo_id} to cache ({len(photo_data)} bytes)")
+        logger.debug(f"Pushed {photo_id[:16]}... to cache")
     except Exception as e:
         logger.warning(f"Failed to push to cache: {e}")
+
+
+# FIX: Helper to get leader URL
+def get_leader_url() -> str:
+    """Get leader URL from directory stats"""
+    try:
+        response = requests.get(f"{DIRECTORY_SERVICE_URL}/stats", timeout=5)
+        if response.status_code == 200:
+            stats = response.json()
+            leader_url = stats.get('current_leader_url')
+            if leader_url:
+                return leader_url
+        return DIRECTORY_SERVICE_URL
+    except:
+        return DIRECTORY_SERVICE_URL
 
 
 # API Endpoints
 
 @app.post("/write")
-@limiter.limit("100/minute")  # IMPROVEMENT #15: Rate limiting
+@limiter.limit("100/minute")
 async def write_photo(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -409,32 +436,39 @@ async def write_photo(
     photo_id: Optional[str] = Form(None)
 ):
     """Write a photo to storage"""
+    # FIX: Generate request ID for tracing
+    request_id = str(uuid.uuid4())
+    
     try:
         photo_data = await photo.read()
         
         if not photo_id:
             photo_id = hashlib.sha256(photo_data).hexdigest()
         
+        logger.info(f"[{request_id}] Writing photo {photo_id[:16]}... ({len(photo_data)} bytes)")
+        
         volume = get_or_create_volume()
         result = volume.write(photo_id, photo_data)
         result['store_id'] = STORE_ID
+        result['request_id'] = request_id
         
-        # IMPROVEMENT #9: Push to cache in background
         background_tasks.add_task(push_to_cache, photo_id, photo_data)
         
-        logger.info(f"Wrote photo {photo_id} ({len(photo_data)} bytes)")
+        logger.info(f"[{request_id}] ✓ Wrote photo {photo_id[:16]}...")
         
         return result
         
     except Exception as e:
-        logger.error(f"Error writing photo: {e}")
+        logger.error(f"[{request_id}] ✗ Error writing photo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/read/{photo_id}")
-@limiter.limit("1000/minute")  # IMPROVEMENT #15: Rate limiting
+@limiter.limit("1000/minute")
 async def read_photo(photo_id: str, request: Request, background_tasks: BackgroundTasks):
     """Read a photo from storage"""
+    request_id = str(uuid.uuid4())
+    
     try:
         photo_data = None
         for volume in volumes.values():
@@ -443,6 +477,7 @@ async def read_photo(photo_id: str, request: Request, background_tasks: Backgrou
                 break
         
         if not photo_data:
+            logger.debug(f"[{request_id}] Photo {photo_id[:16]}... not found")
             raise HTTPException(status_code=404, detail="Photo not found")
         
         background_tasks.add_task(track_access, photo_id)
@@ -452,16 +487,16 @@ async def read_photo(photo_id: str, request: Request, background_tasks: Backgrou
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error reading photo {photo_id}: {e}")
+        logger.error(f"[{request_id}] Error reading photo {photo_id[:16]}...: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/delete/{photo_id}")
-@limiter.limit("50/minute")  # IMPROVEMENT #15: Rate limiting
+@limiter.limit("50/minute")
 async def delete_photo(photo_id: str, request: Request):
-    """
-    IMPROVEMENT #1: Durable delete with tombstone
-    """
+    """Delete photo with tombstone"""
+    request_id = str(uuid.uuid4())
+    
     try:
         deleted = False
         for volume in volumes.values():
@@ -479,23 +514,27 @@ async def delete_photo(photo_id: str, request: Request):
             except:
                 pass
         
-        return {"deleted": True, "photo_id": photo_id}
+        logger.info(f"[{request_id}] ✓ Deleted {photo_id[:16]}...")
+        
+        return {"deleted": True, "photo_id": photo_id, "request_id": request_id}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting photo {photo_id}: {e}")
+        logger.error(f"[{request_id}] Error deleting photo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/replicate")
 async def replicate_photo(request: dict):
     """Replicate a photo from another store"""
+    request_id = request.get('request_id', str(uuid.uuid4()))
+    
     try:
         photo_id = request['photo_id']
         source_store_url = request['source_store_url']
         
-        logger.info(f"Replicating photo {photo_id} from {source_store_url}")
+        logger.info(f"[{request_id}] Replicating photo {photo_id[:16]}... from {source_store_url}")
         
         response = requests.get(f"{source_store_url}/read/{photo_id}", timeout=30)
         if response.status_code != 200:
@@ -506,6 +545,7 @@ async def replicate_photo(request: dict):
         volume = get_or_create_volume()
         result = volume.write(photo_id, photo_data)
         result['store_id'] = STORE_ID
+        result['request_id'] = request_id
         
         # Push to cache
         threading.Thread(
@@ -514,12 +554,12 @@ async def replicate_photo(request: dict):
             daemon=True
         ).start()
         
-        logger.info(f"Replicated photo {photo_id} successfully")
+        logger.info(f"[{request_id}] ✓ Replicated photo {photo_id[:16]}...")
         
         return result
         
     except Exception as e:
-        logger.error(f"Error replicating photo: {e}")
+        logger.error(f"[{request_id}] Error replicating photo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -542,7 +582,8 @@ async def get_stats():
         "available_capacity": total_capacity - used_capacity,
         "volumes": [v.to_dict() for v in volumes.values()],
         "access_stats": access_data,
-        "window_start": stats_window_start
+        "window_start": stats_window_start,
+        "registered": registration_successful
     }
 
 
@@ -552,7 +593,8 @@ async def health_check():
     return {
         "status": "healthy",
         "store_id": STORE_ID,
-        "volumes": len(volumes)
+        "volumes": len(volumes),
+        "registered": registration_successful
     }
 
 
@@ -565,9 +607,7 @@ def track_access(photo_id: str):
 
 
 def report_stats_worker():
-    """
-    IMPROVEMENT #12: Shorter stats window (60s instead of 300s)
-    """
+    """Report stats to replication manager"""
     global stats_window_start
     
     while True:
@@ -614,6 +654,11 @@ def heartbeat_worker():
         try:
             time.sleep(HEARTBEAT_INTERVAL)
             
+            # FIX: Only send heartbeat if registered
+            if not registration_successful:
+                logger.debug("Skipping heartbeat - not registered yet")
+                continue
+            
             total_capacity = MAX_VOLUME_SIZE * 10
             used_capacity = sum(v.current_size for v in volumes.values())
             
@@ -632,9 +677,10 @@ def heartbeat_worker():
             )
             
             if response.status_code == 200:
-                logger.debug("Heartbeat sent successfully")
+                logger.debug("♥ Heartbeat sent successfully")
             elif response.status_code == 404:
-                logger.warning("Directory doesn't recognize store, re-registering...")
+                logger.warning("⚠ Directory doesn't recognize store, re-registering...")
+                registration_successful = False
                 threading.Thread(target=register_with_directory_worker, daemon=True).start()
                 
         except requests.exceptions.ConnectionError:
@@ -654,10 +700,7 @@ def compaction_worker():
                     efficiency = volume.get_efficiency()
                     
                     if efficiency < COMPACTION_THRESHOLD:
-                        logger.info(
-                            f"Volume {volume_id} efficiency {efficiency:.2%} "
-                            f"below threshold, starting compaction"
-                        )
+                        logger.info(f"Volume {volume_id} efficiency {efficiency:.2%} below threshold, starting compaction")
                         
                         try:
                             new_volume = volume.compact()
@@ -675,7 +718,7 @@ def compaction_worker():
                             
                             os.remove(backup_path)
                             
-                            logger.info(f"Compaction complete for {volume_id}")
+                            logger.info(f"✓ Compaction complete for {volume_id}")
                             
                         except Exception as e:
                             logger.error(f"Error compacting volume {volume_id}: {e}")
@@ -686,14 +729,13 @@ def compaction_worker():
 
 def garbage_collection_worker():
     """
-    IMPROVEMENT #5: Garbage collection for orphaned photos
+    FIX: GC now queries leader directly for consistent reads
     """
-    # Wait for system to stabilize
     time.sleep(300)
     
     while True:
         try:
-            time.sleep(3600 * 6)  # Run every 6 hours
+            time.sleep(3600 * 6)
             
             logger.info("Starting garbage collection scan")
             
@@ -707,7 +749,9 @@ def garbage_collection_worker():
             
             logger.info(f"GC: Checking {len(local_photos)} photos")
             
-            # Batch verify with Directory (100 at a time)
+            # FIX: Query leader directly
+            leader_url = get_leader_url()
+            
             orphaned = []
             batch_size = 100
             photo_list = list(local_photos)
@@ -717,7 +761,7 @@ def garbage_collection_worker():
                 
                 try:
                     response = requests.post(
-                        f"{DIRECTORY_SERVICE_URL}/verify_photos",
+                        f"{leader_url}/verify_photos",
                         json={'photo_ids': batch},
                         timeout=30
                     )
@@ -732,32 +776,30 @@ def garbage_collection_worker():
             deleted_count = 0
             for photo_id in orphaned:
                 try:
-                    # Check age
-                    photo_age_hours = 25  # Assume old if orphaned
-                    
-                    if photo_age_hours > 24:
-                        # Delete from volume
-                        for volume in volumes.values():
-                            if volume.delete(photo_id):
-                                deleted_count += 1
-                                logger.info(f"GC: Deleted orphaned photo {photo_id}")
-                                break
+                    # Simple age check - assume orphaned = old
+                    for volume in volumes.values():
+                        if volume.delete(photo_id):
+                            deleted_count += 1
+                            logger.info(f"GC: Deleted orphaned photo {photo_id[:16]}...")
+                            break
                 except Exception as e:
-                    logger.error(f"GC: Error deleting {photo_id}: {e}")
+                    logger.error(f"GC: Error deleting {photo_id[:16]}...: {e}")
             
-            logger.info(f"GC complete: cleaned {deleted_count} orphaned photos")
+            logger.info(f"✓ GC complete: cleaned {deleted_count} orphaned photos")
             
         except Exception as e:
             logger.error(f"Error in garbage collection: {e}")
 
 
 def register_with_directory_worker():
-    """Register with directory service with persistent retry"""
+    """
+    FIX: Register with directory service - retries indefinitely
+    """
+    global registration_successful
     retry_delay = 5
-    max_retries = 20
     attempt = 0
     
-    while attempt < max_retries:
+    while not registration_successful:
         try:
             attempt += 1
             
@@ -780,35 +822,39 @@ def register_with_directory_worker():
             )
             
             if response.status_code == 200:
-                logger.info(f"✓ Successfully registered with Directory Service")
+                registration_successful = True
+                logger.info(f"✓ Successfully registered with Directory Service (attempt {attempt})")
                 return
             else:
                 logger.warning(f"Registration attempt {attempt} returned {response.status_code}")
                 
         except requests.exceptions.ConnectionError:
-            logger.warning(f"Registration attempt {attempt}: Directory not ready, retrying...")
+            logger.warning(f"Registration attempt {attempt}: Directory not ready")
         except Exception as e:
             logger.error(f"Registration attempt {attempt} error: {e}")
         
-        time.sleep(retry_delay)
-    
-    logger.error(f"Failed to register after {max_retries} attempts")
+        # FIX: Retry indefinitely with exponential backoff (max 60s)
+        time.sleep(min(retry_delay, 60))
+        retry_delay = min(retry_delay * 1.5, 60)
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
+    logger.info("=" * 80)
     logger.info(f"Starting Store Service: {STORE_ID}")
+    logger.info("=" * 80)
     
     initialize_volumes()
     
-    threading.Thread(target=register_with_directory_worker, daemon=True).start()
-    threading.Thread(target=report_stats_worker, daemon=True).start()
-    threading.Thread(target=heartbeat_worker, daemon=True).start()
-    threading.Thread(target=compaction_worker, daemon=True).start()
-    threading.Thread(target=garbage_collection_worker, daemon=True).start()
+    threading.Thread(target=register_with_directory_worker, daemon=True, name="Registration").start()
+    threading.Thread(target=report_stats_worker, daemon=True, name="StatsReporter").start()
+    threading.Thread(target=heartbeat_worker, daemon=True, name="Heartbeat").start()
+    threading.Thread(target=compaction_worker, daemon=True, name="Compaction").start()
+    threading.Thread(target=garbage_collection_worker, daemon=True, name="GarbageCollection").start()
     
-    logger.info("Store Service started successfully")
+    logger.info("✓ Store Service started successfully")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
