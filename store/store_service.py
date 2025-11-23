@@ -461,6 +461,80 @@ async def write_photo(
     except Exception as e:
         logger.error(f"[{request_id}] ✗ Error writing photo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.post("/replicate")
+async def replicate_photo(request: dict):
+    """Replicate a photo from another store"""
+    request_id = request.get('request_id', str(uuid.uuid4()))
+    
+    try:
+        photo_id = request['photo_id']
+        source_store_url = request['source_store_url']
+        
+        logger.info(f"[{request_id}] Replicating photo {photo_id[:16]}... from {source_store_url}")
+        
+        response = requests.get(f"{source_store_url}/read/{photo_id}", timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch from source: {response.status_code}")
+        
+        photo_data = response.content
+        
+        volume = get_or_create_volume()
+        result = volume.write(photo_id, photo_data)
+        result['store_id'] = STORE_ID
+        result['request_id'] = request_id
+        
+        # Push to cache
+        threading.Thread(
+            target=push_to_cache,
+            args=(photo_id, photo_data),
+            daemon=True
+        ).start()
+        
+        logger.info(f"[{request_id}] ✓ Replicated photo {photo_id[:16]}...")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error replicating photo: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/stats")
+async def get_stats():
+    """Get store statistics"""
+    total_capacity = MAX_VOLUME_SIZE * 10
+    used_capacity = sum(v.current_size for v in volumes.values())
+    
+    with access_stats_lock:
+        access_data = [
+            {"photo_id": photo_id, "access_count": count}
+            for photo_id, count in access_stats.items()
+        ]
+    
+    return {
+        "store_id": STORE_ID,
+        "total_capacity": total_capacity,
+        "used_capacity": used_capacity,
+        "available_capacity": total_capacity - used_capacity,
+        "volumes": [v.to_dict() for v in volumes.values()],
+        "access_stats": access_data,
+        "window_start": stats_window_start,
+        "registered": registration_successful
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "store_id": STORE_ID,
+        "volumes": len(volumes),
+        "registered": registration_successful
+    }
+
 
 
 @app.get("/read/{photo_id}")
@@ -525,77 +599,9 @@ async def delete_photo(photo_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/replicate")
-async def replicate_photo(request: dict):
-    """Replicate a photo from another store"""
-    request_id = request.get('request_id', str(uuid.uuid4()))
-    
-    try:
-        photo_id = request['photo_id']
-        source_store_url = request['source_store_url']
-        
-        logger.info(f"[{request_id}] Replicating photo {photo_id[:16]}... from {source_store_url}")
-        
-        response = requests.get(f"{source_store_url}/read/{photo_id}", timeout=30)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch from source: {response.status_code}")
-        
-        photo_data = response.content
-        
-        volume = get_or_create_volume()
-        result = volume.write(photo_id, photo_data)
-        result['store_id'] = STORE_ID
-        result['request_id'] = request_id
-        
-        # Push to cache
-        threading.Thread(
-            target=push_to_cache,
-            args=(photo_id, photo_data),
-            daemon=True
-        ).start()
-        
-        logger.info(f"[{request_id}] ✓ Replicated photo {photo_id[:16]}...")
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"[{request_id}] Error replicating photo: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats")
-async def get_stats():
-    """Get store statistics"""
-    total_capacity = MAX_VOLUME_SIZE * 10
-    used_capacity = sum(v.current_size for v in volumes.values())
-    
-    with access_stats_lock:
-        access_data = [
-            {"photo_id": photo_id, "access_count": count}
-            for photo_id, count in access_stats.items()
-        ]
-    
-    return {
-        "store_id": STORE_ID,
-        "total_capacity": total_capacity,
-        "used_capacity": used_capacity,
-        "available_capacity": total_capacity - used_capacity,
-        "volumes": [v.to_dict() for v in volumes.values()],
-        "access_stats": access_data,
-        "window_start": stats_window_start,
-        "registered": registration_successful
-    }
 
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "store_id": STORE_ID,
-        "volumes": len(volumes),
-        "registered": registration_successful
-    }
 
 
 # Background tasks

@@ -3,6 +3,7 @@ Cache Service - Redis-based caching wrapper
 IMPROVEMENTS:
 - Issue #6 & #10: Redis replaces Python LRU cache for better performance
 - Automatic LRU eviction, no GIL contention, guaranteed memory limits
+- FIXED: Route ordering - specific routes BEFORE parameterized routes
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -34,6 +35,174 @@ except Exception as e:
     logger.error(f"Redis connection failed: {e}")
     redis_client = None
 
+
+# ============================================================================
+# IMPORTANT: Define non-parameterized routes FIRST
+# Otherwise /cache/stats gets matched as /cache/{photo_id} where photo_id="stats"
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    if not redis_client:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "reason": "Redis unavailable"}
+        )
+    
+    try:
+        redis_client.ping()
+        info = get_cache_info()
+        
+        return {
+            "status": "healthy",
+            "cache_size_gb": info['current_size_gb'],
+            "photo_count": info['photo_count'],
+            "utilization_percent": info['utilization_percent'],
+            "backend": "Redis"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "reason": str(e)}
+        )
+
+
+@app.get("/cache/info")
+async def get_cache_info():
+    """
+    Get basic cache information (lightweight version of stats)
+    MUST be before @app.get("/cache/{photo_id}") to avoid route conflict
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Cache unavailable")
+    
+    try:
+        info = redis_client.info('memory')
+        
+        # Count photos
+        photo_count = 0
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
+            photo_count += len(keys)
+            if cursor == 0:
+                break
+        
+        return {
+            'photo_count': photo_count,
+            'current_size_gb': round(info.get('used_memory', 0) / (1024**3), 2),
+            'max_size_gb': round(info.get('maxmemory', 0) / (1024**3), 2),
+            'utilization_percent': round(
+                (info.get('used_memory', 0) / info.get('maxmemory', 1)) * 100, 2
+            ) if info.get('maxmemory', 0) > 0 else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting cache info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cache/stats")
+async def get_cache_stats():
+    """
+    Get detailed cache statistics from Redis
+    MUST be before @app.get("/cache/{photo_id}") to avoid route conflict
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Cache unavailable")
+    
+    try:
+        # Get Redis info
+        info = redis_client.info('memory')
+        
+        # Get operation counts
+        hits = int(redis_client.get("cache:hits") or 0)
+        misses = int(redis_client.get("cache:misses") or 0)
+        sets = int(redis_client.get("cache:sets") or 0)
+        deletes = int(redis_client.get("cache:deletes") or 0)
+        
+        total_requests = hits + misses
+        hit_rate = (hits / total_requests * 100) if total_requests > 0 else 0
+        
+        # Count photo keys
+        photo_count = 0
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
+            photo_count += len(keys)
+            if cursor == 0:
+                break
+        
+        return {
+            'size': {
+                'current_bytes': info.get('used_memory', 0),
+                'current_mb': round(info.get('used_memory', 0) / (1024**2), 2),
+                'current_gb': round(info.get('used_memory', 0) / (1024**3), 2),
+                'max_bytes': info.get('maxmemory', 0),
+                'max_gb': round(info.get('maxmemory', 0) / (1024**3), 2),
+                'utilization_percent': round(
+                    (info.get('used_memory', 0) / info.get('maxmemory', 1)) * 100, 2
+                ) if info.get('maxmemory', 0) > 0 else 0
+            },
+            'entries': {
+                'count': photo_count
+            },
+            'operations': {
+                'total_requests': total_requests,
+                'hits': hits,
+                'misses': misses,
+                'hit_rate_percent': round(hit_rate, 2),
+                'sets': sets,
+                'deletes': deletes
+            },
+            'config': {
+                'ttl_seconds': CACHE_TTL,
+                'eviction_policy': 'allkeys-lru',
+                'backend': 'Redis'
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """
+    Clear entire cache (for administrative/testing purposes)
+    MUST be before @app.post("/cache/{photo_id}") to avoid route conflict
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Cache unavailable")
+    
+    try:
+        # Delete all photo keys
+        cursor = 0
+        deleted_count = 0
+        
+        while True:
+            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
+            if keys:
+                deleted_count += redis_client.delete(*keys)
+            
+            if cursor == 0:
+                break
+        
+        return {
+            "success": True,
+            "message": f"Cache cleared: {deleted_count} photos removed"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# NOW define parameterized routes AFTER specific routes
+# ============================================================================
 
 @app.get("/cache/{photo_id}")
 async def get_cached_photo(photo_id: str):
@@ -133,162 +302,6 @@ async def delete_cached_photo(photo_id: str):
     except Exception as e:
         logger.error(f"Error deleting from cache: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/cache/clear")
-async def clear_cache():
-    """
-    Clear entire cache (for administrative/testing purposes)
-    """
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Cache unavailable")
-    
-    try:
-        # Delete all photo keys
-        cursor = 0
-        deleted_count = 0
-        
-        while True:
-            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
-            if keys:
-                deleted_count += redis_client.delete(*keys)
-            
-            if cursor == 0:
-                break
-        
-        return {
-            "success": True,
-            "message": f"Cache cleared: {deleted_count} photos removed"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error clearing cache: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cache/stats")
-async def get_cache_stats():
-    """
-    Get detailed cache statistics from Redis
-    """
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Cache unavailable")
-    
-    try:
-        # Get Redis info
-        info = redis_client.info('memory')
-        
-        # Get operation counts
-        hits = int(redis_client.get("cache:hits") or 0)
-        misses = int(redis_client.get("cache:misses") or 0)
-        sets = int(redis_client.get("cache:sets") or 0)
-        deletes = int(redis_client.get("cache:deletes") or 0)
-        
-        total_requests = hits + misses
-        hit_rate = (hits / total_requests * 100) if total_requests > 0 else 0
-        
-        # Count photo keys
-        photo_count = 0
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
-            photo_count += len(keys)
-            if cursor == 0:
-                break
-        
-        return {
-            'size': {
-                'current_bytes': info.get('used_memory', 0),
-                'current_mb': round(info.get('used_memory', 0) / (1024**2), 2),
-                'current_gb': round(info.get('used_memory', 0) / (1024**3), 2),
-                'max_bytes': info.get('maxmemory', 0),
-                'max_gb': round(info.get('maxmemory', 0) / (1024**3), 2),
-                'utilization_percent': round(
-                    (info.get('used_memory', 0) / info.get('maxmemory', 1)) * 100, 2
-                ) if info.get('maxmemory', 0) > 0 else 0
-            },
-            'entries': {
-                'count': photo_count
-            },
-            'operations': {
-                'total_requests': total_requests,
-                'hits': hits,
-                'misses': misses,
-                'hit_rate_percent': round(hit_rate, 2),
-                'sets': sets,
-                'deletes': deletes
-            },
-            'config': {
-                'ttl_seconds': CACHE_TTL,
-                'eviction_policy': 'allkeys-lru',
-                'backend': 'Redis'
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting cache stats: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cache/info")
-async def get_cache_info():
-    """
-    Get basic cache information
-    """
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Cache unavailable")
-    
-    try:
-        info = redis_client.info('memory')
-        
-        # Count photos
-        photo_count = 0
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor, match="photo:*", count=100)
-            photo_count += len(keys)
-            if cursor == 0:
-                break
-        
-        return {
-            'photo_count': photo_count,
-            'current_size_gb': round(info.get('used_memory', 0) / (1024**3), 2),
-            'max_size_gb': round(info.get('maxmemory', 0) / (1024**3), 2),
-            'utilization_percent': round(
-                (info.get('used_memory', 0) / info.get('maxmemory', 1)) * 100, 2
-            ) if info.get('maxmemory', 0) > 0 else 0
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting cache info: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    if not redis_client:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "reason": "Redis unavailable"}
-        )
-    
-    try:
-        redis_client.ping()
-        info = get_cache_info()
-        
-        return {
-            "status": "healthy",
-            "cache_size_gb": info['current_size_gb'],
-            "photo_count": info['photo_count'],
-            "utilization_percent": info['utilization_percent'],
-            "backend": "Redis"
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "reason": str(e)}
-        )
 
 
 @app.on_event("startup")
