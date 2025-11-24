@@ -1,10 +1,23 @@
 """
-Directory Service - FIXED VERSION
-Critical fixes:
-1. All read endpoints forward to leader for consistency
-2. Synchronous follower notification for critical operations
-3. WAL replay idempotency check
-4. Enhanced logging for debugging
+Directory Service - COMPLETE VERSION with ALL Features
+
+Existing Features Preserved:
+- Leader election with Redis
+- WAL (Write-Ahead Log) persistence
+- Snapshot/restore functionality  
+- Follower synchronization
+- Store health monitoring
+- Photo metadata with checksums
+- Replica tracking
+- Rate limiting
+- Idempotency checks
+
+NEW Additions for Replication Manager:
+- /unregister endpoint (de-replication)
+- Enhanced /photos/list with locations
+- Enhanced /verify_photos response
+- /stores endpoint compatibility
+- notify_new_photo calls to replication manager
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -33,6 +46,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] %(message)s'
 )
+
 logger = logging.getLogger("DirectoryService")
 
 # Configuration
@@ -44,7 +58,7 @@ LEADER_TIMEOUT = int(os.getenv("LEADER_TIMEOUT", 10))
 LEADER_HEARTBEAT_INTERVAL = int(os.getenv("LEADER_HEARTBEAT_INTERVAL", 3))
 FOLLOWER_SYNC_INTERVAL = float(os.getenv("FOLLOWER_SYNC_INTERVAL", 0.5))
 SNAPSHOT_INTERVAL = int(os.getenv("SNAPSHOT_INTERVAL", 60))
-REPLICATION_MANAGER_URL = os.getenv("REPLICATION_MANAGER_URL", "http://replication:9003")
+REPLICATION_MANAGER_URL = os.getenv("REPLICATION_MANAGER_URL", "http://replication:9000")
 
 # Redis client for leader election
 try:
@@ -108,7 +122,7 @@ class DirectoryState:
         self.lock = threading.RLock()
         self.write_ahead_log: List[dict] = []
         self.log_index = 0
-        self.applied_operations: set = set()  # FIX: Track applied ops for idempotency
+        self.applied_operations: set = set()
         self.followers = []
 
 
@@ -132,7 +146,6 @@ def discover_followers():
 
 
 # Redis-based leader election
-
 class RedisLeaderElection:
     def __init__(self, redis_client, ttl=10):
         self.redis = redis_client
@@ -152,7 +165,6 @@ class RedisLeaderElection:
     def try_claim_leadership(self, instance_id: str, instance_url: str) -> bool:
         try:
             term = self.get_next_term()
-            
             claim = json.dumps({
                 'leader_id': instance_id,
                 'leader_url': instance_url,
@@ -172,7 +184,6 @@ class RedisLeaderElection:
                 return True
             
             return False
-            
         except Exception as e:
             logger.error(f"Error claiming leadership: {e}")
             return False
@@ -206,7 +217,6 @@ leader_election = RedisLeaderElection(redis_client) if redis_client else None
 
 
 # Persistence functions
-
 def save_snapshot():
     """Save directory state to disk"""
     try:
@@ -240,14 +250,15 @@ def save_snapshot():
             json.dump(snapshot, f, indent=2)
         
         os.replace(temp_path, snapshot_path)
-        logger.info(f"✓ Saved snapshot: {len(directory_state.photos)} photos, {len(directory_state.stores)} stores")
         
+        logger.info(f"✓ Saved snapshot: {len(directory_state.photos)} photos, {len(directory_state.stores)} stores")
+    
     except Exception as e:
         logger.error(f"✗ Error saving snapshot: {e}")
 
 
 def load_snapshot():
-    """Load directory state from disk with grace period for stores"""
+    """Load directory state from disk"""
     try:
         snapshot_path = os.path.join(DATA_DIRECTORY, 'snapshot.json')
         
@@ -284,19 +295,17 @@ def load_snapshot():
             directory_state.log_index = snapshot.get('log_index', 0)
         
         logger.info(f"✓ Snapshot loaded: {len(directory_state.photos)} photos, {len(directory_state.stores)} stores")
-        
+    
     except Exception as e:
         logger.error(f"✗ Error loading snapshot: {e}")
 
 
 def append_to_wal(operation: dict):
-    """Append operation to write-ahead log with operation ID"""
+    """Append operation to write-ahead log"""
     try:
         os.makedirs(DATA_DIRECTORY, exist_ok=True)
-        
         wal_path = os.path.join(DATA_DIRECTORY, 'wal.jsonl')
         
-        # FIX: Add unique operation ID for idempotency
         if 'operation_id' not in operation:
             operation['operation_id'] = str(uuid.uuid4())
         
@@ -308,20 +317,19 @@ def append_to_wal(operation: dict):
             os.fsync(f.fileno())
         
         directory_state.log_index += 1
-        
+    
     except Exception as e:
         logger.error(f"Error appending to WAL: {e}")
 
 
 def load_wal():
-    """Load and replay write-ahead log with idempotency check"""
+    """Load and replay write-ahead log"""
     try:
         wal_path = os.path.join(DATA_DIRECTORY, 'wal.jsonl')
         
         if not os.path.exists(wal_path):
             return
         
-        # FIX: Only replay operations after snapshot index
         snapshot_index = directory_state.log_index
         
         with open(wal_path, 'r') as f:
@@ -330,23 +338,22 @@ def load_wal():
                     operation = json.loads(line)
                     op_index = operation.get('log_index', 0)
                     
-                    # Skip operations already in snapshot
                     if op_index < snapshot_index:
                         continue
                     
                     apply_operation(operation, from_wal=True)
         
         logger.info(f"✓ Replayed WAL from index {snapshot_index} to {directory_state.log_index}")
-        
+    
     except Exception as e:
         logger.error(f"✗ Error loading WAL: {e}")
 
 
 def apply_operation(operation: dict, from_wal: bool = False):
-    """Apply an operation to the directory state with idempotency"""
+    """Apply an operation to the directory state"""
     try:
-        # FIX: Check if operation already applied
         op_id = operation.get('operation_id')
+        
         if op_id and op_id in directory_state.applied_operations:
             logger.debug(f"Skipping duplicate operation {op_id}")
             return
@@ -370,9 +377,8 @@ def apply_operation(operation: dict, from_wal: bool = False):
                         size_bytes=operation.get('size_bytes')
                     )
                 
-                # Check for duplicate replica
                 existing = [
-                    loc for loc in directory_state.photos[photo_id].replicas 
+                    loc for loc in directory_state.photos[photo_id].replicas
                     if loc.store_id == store_id and loc.volume_id == volume_id
                 ]
                 
@@ -419,20 +425,15 @@ def apply_operation(operation: dict, from_wal: bool = False):
                         store.available_capacity = available_capacity
                     store.status = ServiceStatus.HEALTHY.value
         
-        # Mark operation as applied
         if op_id:
             directory_state.applied_operations.add(op_id)
-        
+    
     except Exception as e:
         logger.error(f"✗ Error applying operation: {e}")
 
 
-# FIX: Synchronous notification for critical operations
 def notify_followers_sync(operation: dict, timeout: float = 2.0):
-    """
-    Synchronously notify followers about critical operations
-    Returns True if majority of followers acknowledged
-    """
+    """Synchronously notify followers"""
     if not directory_state.followers:
         return True
     
@@ -464,11 +465,9 @@ def notify_followers_sync(operation: dict, timeout: float = 2.0):
     majority = len(directory_state.followers) // 2 + 1
     
     logger.info(f"Follower sync: {success_count}/{len(directory_state.followers)} succeeded")
-    
     return success_count >= majority
 
 
-# Push notifications to followers (async for non-critical)
 def notify_followers(operation: dict):
     """Non-blocking notification to followers"""
     for follower_url in directory_state.followers:
@@ -486,18 +485,18 @@ def _send_sync_notification(follower_url: str, operation: dict):
             json={'operations': [operation]},
             timeout=1
         )
+        
         if response.status_code == 200:
             logger.debug(f"✓ Synced to {follower_url}")
+    
     except Exception as e:
         logger.debug(f"✗ Failed to notify {follower_url}: {e}")
 
 
-# Helper function to forward to leader
 def forward_to_leader(path: str, method: str = "GET", json_data: dict = None, timeout: int = 10):
-    """
-    FIX: Centralized function to forward requests to leader
-    """
+    """Forward requests to leader"""
     leader_url = get_leader_url()
+    
     if not leader_url:
         return None
     
@@ -512,13 +511,13 @@ def forward_to_leader(path: str, method: str = "GET", json_data: dict = None, ti
             raise ValueError(f"Unsupported method: {method}")
         
         return response
+    
     except Exception as e:
         logger.error(f"Error forwarding to leader: {e}")
         raise HTTPException(status_code=503, detail="Leader unavailable")
 
 
 # Leader Election functions
-
 def try_claim_leadership():
     """Attempt to claim leadership via Redis"""
     if not leader_election:
@@ -532,11 +531,11 @@ def try_claim_leadership():
                 leadership_state.current_leader_url = INSTANCE_URL
                 leadership_state.last_heartbeat = time.time()
             
-            logger.info(f"🎖  {INSTANCE_ID} became LEADER")
+            logger.info(f"🎖 {INSTANCE_ID} became LEADER")
             return True
         
         return False
-        
+    
     except Exception as e:
         logger.error(f"✗ Error claiming leadership: {e}")
         return False
@@ -556,7 +555,7 @@ def maintain_leadership():
             logger.warning(f"⚠ {INSTANCE_ID} failed to maintain leadership")
             with state_lock:
                 leadership_state.is_leader = False
-        
+    
     except Exception as e:
         logger.error(f"✗ Error maintaining leadership: {e}")
 
@@ -585,7 +584,7 @@ def check_leadership():
                 leadership_state.is_leader = True
             else:
                 leadership_state.is_leader = False
-        
+    
     except Exception as e:
         logger.error(f"✗ Error checking leadership: {e}")
 
@@ -594,14 +593,12 @@ def get_leader_url() -> Optional[str]:
     """Get current leader URL for forwarding requests"""
     with state_lock:
         if leadership_state.is_leader:
-            return None  # We are the leader
+            return None
         return leadership_state.current_leader_url
 
 
-# Store selection functions
-
 def select_store_for_write() -> Optional[StoreInfo]:
-    """Select a healthy store with available capacity for writing"""
+    """Select a healthy store with available capacity"""
     with directory_state.lock:
         available_stores = [
             store for store in directory_state.stores.values()
@@ -620,7 +617,6 @@ def select_store_for_write() -> Optional[StoreInfo]:
 
 
 # Background workers
-
 def leader_election_worker():
     """Continuously manage leader election"""
     logger.info("✓ Leader election worker started")
@@ -633,10 +629,9 @@ def leader_election_worker():
                 maintain_leadership()
             else:
                 check_leadership()
-                
                 if not leadership_state.current_leader_id:
                     try_claim_leadership()
-            
+        
         except Exception as e:
             logger.error(f"✗ Error in leader election worker: {e}")
 
@@ -673,7 +668,7 @@ def follower_sync_worker():
                 
                 if updates:
                     logger.info(f"✓ Synced {len(updates)} updates from leader")
-            
+        
         except Exception as e:
             logger.error(f"✗ Error in follower sync worker: {e}")
 
@@ -688,7 +683,7 @@ def snapshot_worker():
             
             if leadership_state.is_leader:
                 save_snapshot()
-            
+        
         except Exception as e:
             logger.error(f"✗ Error in snapshot worker: {e}")
 
@@ -700,7 +695,6 @@ def store_health_monitor():
     while True:
         try:
             time.sleep(30)
-            
             current_time = int(time.time())
             
             with directory_state.lock:
@@ -712,15 +706,17 @@ def store_health_monitor():
                         if store.status != ServiceStatus.DOWN.value:
                             store.status = ServiceStatus.DOWN.value
                             logger.warning(f"⚠ Store {store.store_id} marked as DOWN")
+                    
                     elif time_since_heartbeat > 60:
                         if store.status != ServiceStatus.DEGRADED.value:
                             store.status = ServiceStatus.DEGRADED.value
                             logger.warning(f"⚠ Store {store.store_id} marked as DEGRADED")
+                    
                     else:
                         if store.status != ServiceStatus.HEALTHY.value:
                             store.status = ServiceStatus.HEALTHY.value
                             logger.info(f"✓ Store {store.store_id} marked as HEALTHY")
-            
+        
         except Exception as e:
             logger.error(f"✗ Error in store health monitor: {e}")
 
@@ -736,8 +732,8 @@ async def lifespan(app: FastAPI):
     discover_followers()
     load_snapshot()
     load_wal()
-    
     check_leadership()
+    
     if not leadership_state.current_leader_id:
         try_claim_leadership()
     
@@ -753,6 +749,7 @@ async def lifespan(app: FastAPI):
     
     if leadership_state.is_leader:
         save_snapshot()
+    
     logger.info("Directory Service shutting down")
 
 
@@ -763,15 +760,17 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-# API Endpoints
+# ============================================================================
+# API ENDPOINTS - ALL EXISTING + NEW
+# ============================================================================
 
 @app.post("/allocate")
 @limiter.limit("1000/minute")
 async def allocate_write(request: Request):
     """Allocate a store for writing a new photo"""
     req_data = await request.json()
-    
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.info(f"→ Forwarding /allocate to leader at {leader_url}")
         response = forward_to_leader("/allocate", method="POST", json_data=req_data)
@@ -794,7 +793,7 @@ async def allocate_write(request: Request):
             'primary_store_url': store.store_url,
             'allocated_at': time.time()
         }
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -807,8 +806,8 @@ async def allocate_write(request: Request):
 async def register_photo(request: Request):
     """Register a photo location after successful write"""
     req_data = await request.json()
-    
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.info(f"→ Forwarding /register to leader at {leader_url}")
         response = forward_to_leader("/register", method="POST", json_data=req_data)
@@ -845,11 +844,10 @@ async def register_photo(request: Request):
         apply_operation(operation)
         append_to_wal(operation)
         
-        # FIX: Synchronous notification for critical operations
         if leadership_state.is_leader:
             notify_followers_sync(operation, timeout=2.0)
         
-        # Notify Replication Manager
+        # NEW: Notify Replication Manager
         try:
             threading.Thread(
                 target=notify_replication_manager,
@@ -860,7 +858,7 @@ async def register_photo(request: Request):
             logger.warning(f"⚠ Failed to notify replication manager: {e}")
         
         return {'success': True, 'photo_id': photo_id}
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -870,11 +868,9 @@ async def register_photo(request: Request):
 
 @app.get("/locate/{photo_id}")
 async def locate_photo(photo_id: str):
-    """
-    FIX: Forward to leader for consistent reads
-    Get locations where a photo is stored
-    """
+    """Get locations where a photo is stored"""
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding /locate to leader at {leader_url}")
         try:
@@ -883,7 +879,6 @@ async def locate_photo(photo_id: str):
         except HTTPException:
             raise
     
-    # We are the leader
     try:
         logger.debug(f"→ Locating photo {photo_id[:16]}...")
         
@@ -893,8 +888,8 @@ async def locate_photo(photo_id: str):
                 raise HTTPException(status_code=404, detail="Photo not found")
             
             metadata = directory_state.photos[photo_id]
-            
             accessible_locations = []
+            
             for loc in metadata.replicas:
                 if loc.status != 'active':
                     continue
@@ -921,7 +916,7 @@ async def locate_photo(photo_id: str):
                 'locations': accessible_locations,
                 'replica_count': len(accessible_locations)
             }
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -933,8 +928,8 @@ async def locate_photo(photo_id: str):
 @limiter.limit("100/minute")
 async def delete_photo(photo_id: str, request: Request):
     """Delete a photo from the system"""
-    
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.info(f"→ Forwarding /delete to leader at {leader_url}")
         response = forward_to_leader(f"/delete/{photo_id}", method="DELETE")
@@ -970,9 +965,8 @@ async def delete_photo(photo_id: str, request: Request):
             ).start()
         
         logger.info(f"✓ Deleted photo {photo_id[:16]}...")
-        
         return {'success': True, 'photo_id': photo_id, 'deleted': True}
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -983,8 +977,8 @@ async def delete_photo(photo_id: str, request: Request):
 @app.post("/stores/register")
 async def register_store(request: dict):
     """Register a new store or update existing store"""
-    
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding /stores/register to leader")
         response = forward_to_leader("/stores/register", method="POST", json_data=request)
@@ -1019,7 +1013,7 @@ async def register_store(request: dict):
                 logger.info(f"✓ New store registered: {store_id}")
         
         return {'success': True, 'store_id': store_id}
-        
+    
     except Exception as e:
         logger.error(f"✗ Error registering store: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1027,9 +1021,9 @@ async def register_store(request: dict):
 
 @app.post("/stores/heartbeat")
 async def store_heartbeat(request: dict):
-    """Receive heartbeat from a store and replicate to followers"""
-    
+    """Receive heartbeat from a store"""
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding heartbeat to leader")
         response = forward_to_leader("/stores/heartbeat", method="POST", json_data=request)
@@ -1046,7 +1040,6 @@ async def store_heartbeat(request: dict):
                 if available_capacity is not None:
                     store.available_capacity = available_capacity
                 store.status = ServiceStatus.HEALTHY.value
-                
                 logger.debug(f"♥ Heartbeat from {store_id}")
             else:
                 logger.warning(f"⚠ Heartbeat from unknown store: {store_id}")
@@ -1063,7 +1056,7 @@ async def store_heartbeat(request: dict):
             notify_followers(operation)
         
         return {'success': True}
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -1073,11 +1066,9 @@ async def store_heartbeat(request: dict):
 
 @app.get("/stores")
 async def list_stores(healthy_only: bool = True):
-    """
-    FIX: Forward to leader for consistent reads
-    List all registered stores
-    """
+    """List all registered stores"""
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding /stores to leader")
         try:
@@ -1086,7 +1077,6 @@ async def list_stores(healthy_only: bool = True):
         except HTTPException:
             raise
     
-    # We are the leader
     try:
         with directory_state.lock:
             stores = []
@@ -1097,16 +1087,15 @@ async def list_stores(healthy_only: bool = True):
                 stores.append({
                     'store_id': store.store_id,
                     'store_url': store.store_url,
-                    'total_capacity': store.total_capacity,
+                    'capacity': store.total_capacity,
                     'available_capacity': store.available_capacity,
                     'status': store.status,
                     'last_heartbeat_age': time.time() - store.last_heartbeat
                 })
-        
-        logger.info(f"✓ Returning {len(stores)} stores (healthy_only={healthy_only})")
-        
-        return {'stores': stores, 'count': len(stores)}
-        
+            
+            logger.info(f"✓ Returning {len(stores)} stores (healthy_only={healthy_only})")
+            return stores
+    
     except Exception as e:
         logger.error(f"✗ Error listing stores: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1114,11 +1103,9 @@ async def list_stores(healthy_only: bool = True):
 
 @app.get("/photos/list")
 async def list_all_photos(offset: int = 0, limit: int = 1000):
-    """
-    FIX: Forward to leader for consistent reads
-    Paginated photo listing for full scans
-    """
+    """Paginated photo listing with locations"""
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding /photos/list to leader")
         try:
@@ -1127,7 +1114,6 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
         except HTTPException:
             raise
     
-    # We are the leader
     try:
         with directory_state.lock:
             all_photo_ids = sorted(directory_state.photos.keys())
@@ -1137,17 +1123,24 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
             for photo_id in page:
                 metadata = directory_state.photos[photo_id]
                 
-                accessible_count = 0
+                # Build locations list
+                locations = []
                 for loc in metadata.replicas:
                     if loc.status != 'active':
                         continue
+                    
                     store = directory_state.stores.get(loc.store_id)
                     if store and store.status != ServiceStatus.DOWN.value:
-                        accessible_count += 1
+                        locations.append({
+                            'store_id': loc.store_id,
+                            'store_url': loc.store_url,
+                            'volume_id': loc.volume_id
+                        })
                 
                 photos.append({
                     'photo_id': photo_id,
-                    'replica_count': accessible_count,
+                    'locations': locations,
+                    'replica_count': len(locations),
                     'target_replicas': metadata.target_replica_count,
                     'created_at': metadata.created_at,
                     'checksum': metadata.sha256_checksum,
@@ -1162,7 +1155,7 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
                 'offset': offset,
                 'limit': limit
             }
-        
+    
     except Exception as e:
         logger.error(f"✗ Error listing photos: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1170,11 +1163,9 @@ async def list_all_photos(offset: int = 0, limit: int = 1000):
 
 @app.post("/verify_photos")
 async def verify_photos(request: dict):
-    """
-    FIX: Forward to leader for consistent reads
-    Check if photos are registered
-    """
+    """Verify which photos are registered"""
     leader_url = get_leader_url()
+    
     if leader_url:
         logger.debug(f"→ Forwarding /verify_photos to leader")
         try:
@@ -1183,43 +1174,58 @@ async def verify_photos(request: dict):
         except HTTPException:
             raise
     
-    # We are the leader
     try:
         photo_ids = request['photo_ids']
+        store_id = request.get('store_id')
         
         with directory_state.lock:
-            registered = set(directory_state.photos.keys())
+            registered = [
+                pid for pid in photo_ids
+                if pid in directory_state.photos
+            ]
         
-        not_found = [pid for pid in photo_ids if pid not in registered]
-        
-        logger.debug(f"✓ Verified {len(photo_ids)} photos: {len(not_found)} not found")
+        logger.debug(f"✓ Verified {len(registered)}/{len(photo_ids)} photos for {store_id}")
         
         return {
-            'requested': len(photo_ids),
-            'registered': len(photo_ids) - len(not_found),
-            'not_found': not_found
+            'registered_photo_ids': registered,
+            'store_id': store_id
         }
-        
+    
     except Exception as e:
         logger.error(f"✗ Error verifying photos: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/internal/remove_replica")
-async def remove_replica(request: dict):
-    """Remove a replica (for de-replication)"""
-    
+@app.post("/unregister")
+async def unregister_photo(request: dict):
+    """Remove a photo location (de-replication)"""
     leader_url = get_leader_url()
+    
     if leader_url:
-        logger.debug(f"→ Forwarding /internal/remove_replica to leader")
-        response = forward_to_leader("/internal/remove_replica", method="POST", json_data=request)
+        logger.debug(f"→ Forwarding /unregister to leader")
+        response = forward_to_leader("/unregister", method="POST", json_data=request)
         return JSONResponse(content=response.json(), status_code=response.status_code)
     
     try:
         photo_id = request['photo_id']
         store_id = request['store_id']
         
-        logger.info(f"→ Removing replica {photo_id[:16]}... from {store_id}")
+        logger.info(f"→ Unregistering {photo_id[:16]}... from {store_id}")
+        
+        # Check if exists (idempotency)
+        with directory_state.lock:
+            if photo_id not in directory_state.photos:
+                logger.info(f"Photo {photo_id} already unregistered (idempotent)")
+                return {'success': True}
+            
+            location_exists = any(
+                loc.store_id == store_id
+                for loc in directory_state.photos[photo_id].replicas
+            )
+            
+            if not location_exists:
+                logger.info(f"Location {store_id} already unregistered (idempotent)")
+                return {'success': True}
         
         operation = {
             'type': 'remove_replica',
@@ -1235,10 +1241,16 @@ async def remove_replica(request: dict):
             notify_followers(operation)
         
         return {'success': True}
-        
+    
     except Exception as e:
-        logger.error(f"✗ Error removing replica: {e}")
+        logger.error(f"✗ Error unregistering photo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/remove_replica")
+async def remove_replica(request: dict):
+    """Remove a replica (legacy endpoint)"""
+    return await unregister_photo(request)
 
 
 @app.get("/stats")
@@ -1247,7 +1259,6 @@ async def get_stats():
     with directory_state.lock:
         total_photos = len(directory_state.photos)
         total_stores = len(directory_state.stores)
-        
         healthy_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.HEALTHY.value])
         degraded_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.DEGRADED.value])
         down_stores = len([s for s in directory_state.stores.values() if s.status == ServiceStatus.DOWN.value])
@@ -1288,8 +1299,8 @@ async def get_updates(since_index: int = 0):
     """Get updates since a specific log index"""
     try:
         updates = []
-        
         wal_path = os.path.join(DATA_DIRECTORY, 'wal.jsonl')
+        
         if os.path.exists(wal_path):
             with open(wal_path, 'r') as f:
                 for line in f:
@@ -1302,7 +1313,7 @@ async def get_updates(since_index: int = 0):
             'updates': updates,
             'current_index': directory_state.log_index
         }
-        
+    
     except Exception as e:
         logger.error(f"✗ Error getting updates: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1313,6 +1324,7 @@ async def receive_sync(request: dict):
     """Receive real-time sync from leader"""
     try:
         operations = request['operations']
+        
         for operation in operations:
             apply_operation(operation, from_wal=True)
         
@@ -1320,39 +1332,40 @@ async def receive_sync(request: dict):
             logger.debug(f"✓ Synced {len(operations)} operations from leader")
         
         return {'success': True, 'operations_applied': len(operations)}
-        
+    
     except Exception as e:
         logger.error(f"✗ Error receiving sync: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # Helper functions
-
 def notify_replication_manager(photo_id: str):
     """Notify replication manager about new photo"""
     try:
-        with directory_state.lock:
-            if photo_id not in directory_state.photos:
-                return
+        # Retry logic with exponential backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    f"{REPLICATION_MANAGER_URL}/notify_new_photo",
+                    json={'photo_id': photo_id},
+                    timeout=2
+                )
+                
+                if response.status_code == 200:
+                    logger.debug(f"✓ Notified replication manager about {photo_id[:16]}...")
+                    return
+                
+                # Retry after brief delay
+                if attempt < max_retries - 1:
+                    time.sleep(0.1 * (2 ** attempt))
             
-            metadata = directory_state.photos[photo_id]
-            current_replicas = len([loc for loc in metadata.replicas if loc.status == 'active'])
-        
-        notification = {
-            'photo_id': photo_id,
-            'current_replica_count': current_replicas,
-            'target_replica_count': metadata.target_replica_count
-        }
-        
-        response = requests.post(
-            f"{REPLICATION_MANAGER_URL}/replication/trigger",
-            json=notification,
-            timeout=5
-        )
-        
-        if response.status_code == 200:
-            logger.debug(f"✓ Notified replication manager about {photo_id[:16]}...")
-        
+            except requests.exceptions.RequestException:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1 * (2 ** attempt))
+                    continue
+                raise
+    
     except Exception as e:
         logger.warning(f"⚠ Failed to notify replication manager: {e}")
 
@@ -1367,7 +1380,7 @@ def delete_from_store(store_url: str, photo_id: str):
         
         if response.status_code == 200:
             logger.debug(f"✓ Deleted {photo_id[:16]}... from {store_url}")
-        
+    
     except Exception as e:
         logger.warning(f"⚠ Failed to delete from store {store_url}: {e}")
 

@@ -35,8 +35,6 @@ services:
       - directory-1
       - directory-2
       - directory-3
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - haystack-network
     restart: unless-stopped
@@ -68,19 +66,20 @@ services:
       - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - COMPACTION_INTERVAL=3600
       - GC_INTERVAL=21600
+      - HEARTBEAT_INTERVAL=30
       
-      # NEW: EWMA Access Tracking Configuration
-      - ACCESS_WINDOW_SECONDS=300        # 5 minutes sliding window
-      - EWMA_ALPHA=0.3                   # Smoothing factor (0.3 = balanced)
-      - STATS_REPORT_INTERVAL=60         # Report to replication manager every 60s
+      # EWMA Access Tracking (FIXED)
+      - ACCESS_WINDOW_SECONDS=300
+      - EWMA_ALPHA=0.3
+      - STATS_REPORT_INTERVAL=60
     volumes:
       - store-1-data:/data
     networks:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -103,7 +102,7 @@ services:
       - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - COMPACTION_INTERVAL=3600
       - GC_INTERVAL=21600
-      # EWMA Configuration
+      - HEARTBEAT_INTERVAL=30
       - ACCESS_WINDOW_SECONDS=300
       - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
@@ -113,8 +112,8 @@ services:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
 
   store-3:
     build: ./store
@@ -132,7 +131,7 @@ services:
       - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - COMPACTION_INTERVAL=3600
       - GC_INTERVAL=21600
-      # EWMA Configuration
+      - HEARTBEAT_INTERVAL=30
       - ACCESS_WINDOW_SECONDS=300
       - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
@@ -142,8 +141,8 @@ services:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
 
   store-4:
     build: ./store
@@ -161,7 +160,7 @@ services:
       - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - COMPACTION_INTERVAL=3600
       - GC_INTERVAL=21600
-      # EWMA Configuration
+      - HEARTBEAT_INTERVAL=30
       - ACCESS_WINDOW_SECONDS=300
       - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
@@ -171,8 +170,8 @@ services:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
 
   store-5:
     build: ./store
@@ -190,7 +189,7 @@ services:
       - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - COMPACTION_INTERVAL=3600
       - GC_INTERVAL=21600
-      # EWMA Configuration
+      - HEARTBEAT_INTERVAL=30
       - ACCESS_WINDOW_SECONDS=300
       - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
@@ -200,8 +199,8 @@ services:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
 
   # ============================================================================
   # Directory Services with Leader Election
@@ -212,29 +211,23 @@ services:
     ports:
       - "9001:9000"
     environment:
-      # Instance configuration
       - INSTANCE_ID=directory-1
       - INSTANCE_URL=http://directory-1:9000
+      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
-      
-      # WAL and Snapshot
-      - WAL_PATH=/data/wal.jsonl
-      - SNAPSHOT_PATH=/data/snapshot.json
-      
-      # Leader election
-      - LEADER_TIMEOUT=10                    # Leader lease TTL
-      - LEADER_HEARTBEAT_INTERVAL=3          # Heartbeat every 3s
-      - FOLLOWER_SYNC_INTERVAL=0.5           # Sync from leader every 0.5s
-      
-      # Snapshot interval
-      - SNAPSHOT_INTERVAL=60                 # Snapshot every 60s
+      - LEADER_TIMEOUT=10
+      - LEADER_HEARTBEAT_INTERVAL=3
+      - FOLLOWER_SYNC_INTERVAL=0.5
+      - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9000
     volumes:
       - directory-1-data:/data
     networks:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 30s
@@ -249,20 +242,21 @@ services:
     environment:
       - INSTANCE_ID=directory-2
       - INSTANCE_URL=http://directory-2:9000
+      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
-      - WAL_PATH=/data/wal.jsonl
-      - SNAPSHOT_PATH=/data/snapshot.json
       - LEADER_TIMEOUT=10
       - LEADER_HEARTBEAT_INTERVAL=3
       - FOLLOWER_SYNC_INTERVAL=0.5
       - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9000
     volumes:
       - directory-2-data:/data
     networks:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   directory-3:
     build: ./directory
@@ -272,23 +266,24 @@ services:
     environment:
       - INSTANCE_ID=directory-3
       - INSTANCE_URL=http://directory-3:9000
+      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
-      - WAL_PATH=/data/wal.jsonl
-      - SNAPSHOT_PATH=/data/snapshot.json
       - LEADER_TIMEOUT=10
       - LEADER_HEARTBEAT_INTERVAL=3
       - FOLLOWER_SYNC_INTERVAL=0.5
       - SNAPSHOT_INTERVAL=60
+      - REPLICATION_MANAGER_URL=http://replication:9000
     volumes:
       - directory-3-data:/data
     networks:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   # ============================================================================
-  # Replication Manager with ALL CRITICAL FIXES
+  # Replication Manager with ALL Fixes
   # ============================================================================
   replication:
     build: ./replication
@@ -304,18 +299,18 @@ services:
       - MIN_REPLICA_COUNT=2
       - MAX_REPLICA_COUNT=5
       
-      # Worker configuration
-      - REPLICATION_WORKERS=5              # Number of replication worker threads
-      - DE_REPLICATION_WORKERS=2           # Number of de-replication worker threads
+      # Worker configuration (FIXED)
+      - REPLICATION_WORKERS=5
+      - DE_REPLICATION_WORKERS=2
       
-      # NEW: EWMA Aggregation Configuration
-      - STATS_STALENESS_THRESHOLD=300      # 5 minutes - exclude stale store reports
-      - ACCESS_RATE_THRESHOLD=200          # 200 req/min - trigger +1 replica
-      - HIGH_ACCESS_THRESHOLD=500          # 500 req/min - trigger +2 replicas
-      - COOL_DOWN_THRESHOLD=50             # 50 req/min - scale down to default
+      # EWMA Aggregation (FIXED)
+      - STATS_STALENESS_THRESHOLD=300
+      - ACCESS_RATE_THRESHOLD=200
+      - HIGH_ACCESS_THRESHOLD=500
+      - COOL_DOWN_THRESHOLD=50
       
-      # NEW: De-replication Configuration
-      - DE_REPLICATION_GRACE_PERIOD=3600   # 1 hour grace period before de-replication
+      # De-replication (FIXED)
+      - DE_REPLICATION_GRACE_PERIOD=3600
     networks:
       - haystack-network
     restart: unless-stopped
@@ -337,14 +332,14 @@ services:
       - "8100:8000"
     environment:
       - REDIS_URL=redis://redis:6379
-      - CACHE_TTL=3600                     # 1 hour TTL
+      - CACHE_TTL=3600
       - DIRECTORY_SERVICE_URL=http://nginx
     networks:
       - haystack-network
     restart: unless-stopped
     depends_on:
-      - redis
-      - nginx
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -352,7 +347,7 @@ services:
       retries: 3
 
   # ============================================================================
-  # Client Service (Interactive)
+  # Client Service
   # ============================================================================
   client:
     build: ./client
@@ -369,7 +364,6 @@ services:
       - replication
     stdin_open: true
     tty: true
-    # No restart policy - interactive service
 
 # ============================================================================
 # Networks
