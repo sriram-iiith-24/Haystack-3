@@ -1,7 +1,10 @@
 version: '3.8'
 
 services:
-  # Redis for caching and leader election
+
+  # ============================================================================
+  # Redis - For caching and leader election
+  # ============================================================================
   redis:
     image: redis:7-alpine
     container_name: haystack-redis
@@ -20,7 +23,9 @@ services:
       timeout: 3s
       retries: 3
 
-  # Nginx Load Balancer
+  # ============================================================================
+  # Nginx - Load Balancer for Directory Services
+  # ============================================================================
   nginx:
     build: ./nginx
     container_name: haystack-nginx
@@ -30,6 +35,8 @@ services:
       - directory-1
       - directory-2
       - directory-3
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - haystack-network
     restart: unless-stopped
@@ -39,31 +46,46 @@ services:
       timeout: 3s
       retries: 3
 
-  # Store Services
+  # ============================================================================
+  # Store Services with EWMA Access Tracking
+  # ============================================================================
   store-1:
     build: ./store
     container_name: haystack-store-1
     ports:
       - "8001:8000"
     environment:
+      # Core configuration
       - STORE_ID=store-1
       - STORE_URL=http://store-1:8000
       - VOLUME_DIRECTORY=/data/volumes
       - MAX_VOLUME_SIZE=4294967296
-      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - DIRECTORY_SERVICE_URL=http://nginx
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REPLICATION_MANAGER_URL=http://replication:9000
       - REDIS_URL=redis://redis:6379
-      - STATS_REPORT_INTERVAL=60
-      - HEARTBEAT_INTERVAL=30
+      
+      # Compaction and GC
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - COMPACTION_INTERVAL=3600
+      - GC_INTERVAL=21600
+      
+      # NEW: EWMA Access Tracking Configuration
+      - ACCESS_WINDOW_SECONDS=300        # 5 minutes sliding window
+      - EWMA_ALPHA=0.3                   # Smoothing factor (0.3 = balanced)
+      - STATS_REPORT_INTERVAL=60         # Report to replication manager every 60s
     volumes:
-      - ./data/store-1:/data/volumes
+      - store-1-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+      - nginx
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   store-2:
     build: ./store
@@ -75,20 +97,24 @@ services:
       - STORE_URL=http://store-2:8000
       - VOLUME_DIRECTORY=/data/volumes
       - MAX_VOLUME_SIZE=4294967296
-      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - DIRECTORY_SERVICE_URL=http://nginx
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REPLICATION_MANAGER_URL=http://replication:9000
       - REDIS_URL=redis://redis:6379
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - COMPACTION_INTERVAL=3600
+      - GC_INTERVAL=21600
+      # EWMA Configuration
+      - ACCESS_WINDOW_SECONDS=300
+      - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
-      - HEARTBEAT_INTERVAL=30
     volumes:
-      - ./data/store-2:/data/volumes
+      - store-2-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+      - nginx
 
   store-3:
     build: ./store
@@ -100,20 +126,24 @@ services:
       - STORE_URL=http://store-3:8000
       - VOLUME_DIRECTORY=/data/volumes
       - MAX_VOLUME_SIZE=4294967296
-      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - DIRECTORY_SERVICE_URL=http://nginx
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REPLICATION_MANAGER_URL=http://replication:9000
       - REDIS_URL=redis://redis:6379
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - COMPACTION_INTERVAL=3600
+      - GC_INTERVAL=21600
+      # EWMA Configuration
+      - ACCESS_WINDOW_SECONDS=300
+      - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
-      - HEARTBEAT_INTERVAL=30
     volumes:
-      - ./data/store-3:/data/volumes
+      - store-3-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+      - nginx
 
   store-4:
     build: ./store
@@ -125,20 +155,24 @@ services:
       - STORE_URL=http://store-4:8000
       - VOLUME_DIRECTORY=/data/volumes
       - MAX_VOLUME_SIZE=4294967296
-      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - DIRECTORY_SERVICE_URL=http://nginx
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REPLICATION_MANAGER_URL=http://replication:9000
       - REDIS_URL=redis://redis:6379
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - COMPACTION_INTERVAL=3600
+      - GC_INTERVAL=21600
+      # EWMA Configuration
+      - ACCESS_WINDOW_SECONDS=300
+      - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
-      - HEARTBEAT_INTERVAL=30
     volumes:
-      - ./data/store-4:/data/volumes
+      - store-4-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+      - nginx
 
   store-5:
     build: ./store
@@ -150,147 +184,183 @@ services:
       - STORE_URL=http://store-5:8000
       - VOLUME_DIRECTORY=/data/volumes
       - MAX_VOLUME_SIZE=4294967296
-      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
       - DIRECTORY_SERVICE_URL=http://nginx
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      - REPLICATION_MANAGER_URL=http://replication:9000
       - REDIS_URL=redis://redis:6379
+      - COMPACTION_EFFICIENCY_THRESHOLD=0.60
+      - COMPACTION_INTERVAL=3600
+      - GC_INTERVAL=21600
+      # EWMA Configuration
+      - ACCESS_WINDOW_SECONDS=300
+      - EWMA_ALPHA=0.3
       - STATS_REPORT_INTERVAL=60
-      - HEARTBEAT_INTERVAL=30
     volumes:
-      - ./data/store-5:/data/volumes
+      - store-5-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+      - nginx
 
-  # Directory Services (3 replicas with Redis-based leader election)
+  # ============================================================================
+  # Directory Services with Leader Election
+  # ============================================================================
   directory-1:
     build: ./directory
     container_name: haystack-directory-1
     ports:
-      - "9000:9000"
+      - "9001:9000"
     environment:
+      # Instance configuration
       - INSTANCE_ID=directory-1
       - INSTANCE_URL=http://directory-1:9000
-      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
-      - LEADER_TIMEOUT=10
-      - LEADER_HEARTBEAT_INTERVAL=3
-      - FOLLOWER_SYNC_INTERVAL=0.5
-      - SNAPSHOT_INTERVAL=60
-      - REPLICATION_MANAGER_URL=http://replication:9003
+      
+      # WAL and Snapshot
+      - WAL_PATH=/data/wal.jsonl
+      - SNAPSHOT_PATH=/data/snapshot.json
+      
+      # Leader election
+      - LEADER_TIMEOUT=10                    # Leader lease TTL
+      - LEADER_HEARTBEAT_INTERVAL=3          # Heartbeat every 3s
+      - FOLLOWER_SYNC_INTERVAL=0.5           # Sync from leader every 0.5s
+      
+      # Snapshot interval
+      - SNAPSHOT_INTERVAL=60                 # Snapshot every 60s
     volumes:
-      - ./data/directory-1:/data/directory
+      - directory-1-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   directory-2:
     build: ./directory
     container_name: haystack-directory-2
     ports:
-      - "9001:9000"
+      - "9002:9000"
     environment:
       - INSTANCE_ID=directory-2
       - INSTANCE_URL=http://directory-2:9000
-      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
+      - WAL_PATH=/data/wal.jsonl
+      - SNAPSHOT_PATH=/data/snapshot.json
       - LEADER_TIMEOUT=10
       - LEADER_HEARTBEAT_INTERVAL=3
       - FOLLOWER_SYNC_INTERVAL=0.5
       - SNAPSHOT_INTERVAL=60
-      - REPLICATION_MANAGER_URL=http://replication:9003
     volumes:
-      - ./data/directory-2:/data/directory
+      - directory-2-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
 
   directory-3:
     build: ./directory
     container_name: haystack-directory-3
     ports:
-      - "9002:9000"
+      - "9003:9000"
     environment:
       - INSTANCE_ID=directory-3
       - INSTANCE_URL=http://directory-3:9000
-      - DATA_DIRECTORY=/data/directory
       - REDIS_URL=redis://redis:6379
+      - WAL_PATH=/data/wal.jsonl
+      - SNAPSHOT_PATH=/data/snapshot.json
       - LEADER_TIMEOUT=10
       - LEADER_HEARTBEAT_INTERVAL=3
       - FOLLOWER_SYNC_INTERVAL=0.5
       - SNAPSHOT_INTERVAL=60
-      - REPLICATION_MANAGER_URL=http://replication:9003
     volumes:
-      - ./data/directory-3:/data/directory
+      - directory-3-data:/data
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
+    depends_on:
+      - redis
 
-  # Replication Manager
+  # ============================================================================
+  # Replication Manager with ALL CRITICAL FIXES
+  # ============================================================================
   replication:
     build: ./replication
     container_name: haystack-replication
     ports:
-      - "9003:9003"
+      - "9004:9000"
     environment:
+      # Core configuration
       - DIRECTORY_SERVICE_URL=http://nginx
+      
+      # Replication policies
       - DEFAULT_REPLICA_COUNT=3
-      - MAX_REPLICA_COUNT=5
       - MIN_REPLICA_COUNT=2
-      - ACCESS_RATE_THRESHOLD=200
-      - HIGH_ACCESS_THRESHOLD=500
-      - WORKER_THREAD_COUNT=5
-      - STATS_COLLECTION_INTERVAL=60
-      - MONITORING_INTERVAL=60
-      - NIGHTLY_AUDIT_HOUR=2
-      - DATA_DIRECTORY=/data/replication
-    volumes:
-      - ./data/replication:/data/replication
+      - MAX_REPLICA_COUNT=5
+      
+      # Worker configuration
+      - REPLICATION_WORKERS=5              # Number of replication worker threads
+      - DE_REPLICATION_WORKERS=2           # Number of de-replication worker threads
+      
+      # NEW: EWMA Aggregation Configuration
+      - STATS_STALENESS_THRESHOLD=300      # 5 minutes - exclude stale store reports
+      - ACCESS_RATE_THRESHOLD=200          # 200 req/min - trigger +1 replica
+      - HIGH_ACCESS_THRESHOLD=500          # 500 req/min - trigger +2 replicas
+      - COOL_DOWN_THRESHOLD=50             # 50 req/min - scale down to default
+      
+      # NEW: De-replication Configuration
+      - DE_REPLICATION_GRACE_PERIOD=3600   # 1 hour grace period before de-replication
     networks:
       - haystack-network
+    restart: unless-stopped
     depends_on:
       - nginx
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # Cache Service (Redis wrapper)
+  # ============================================================================
+  # Cache Service
+  # ============================================================================
   cache:
     build: ./cache
     container_name: haystack-cache
     ports:
-      - "8100:8100"
+      - "8100:8000"
     environment:
       - REDIS_URL=redis://redis:6379
-      - CACHE_TTL=3600
+      - CACHE_TTL=3600                     # 1 hour TTL
+      - DIRECTORY_SERVICE_URL=http://nginx
     networks:
       - haystack-network
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
-  
-  # Client
+    depends_on:
+      - redis
+      - nginx
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # Client Service (Interactive)
+  # ============================================================================
   client:
     build: ./client
     container_name: haystack-client
     environment:
       - DIRECTORY_SERVICE_URL=http://nginx
-      - CACHE_SERVICE_URL=http://cache:8100
-      - REPLICATION_MANAGER_URL=http://replication:9003
-    volumes:
-      - ./client:/app
-      - ./test-images:/images
+      - CACHE_SERVICE_URL=http://cache:8000
+      - REPLICATION_MANAGER_URL=http://replication:9000
     networks:
       - haystack-network
     depends_on:
@@ -299,21 +369,37 @@ services:
       - replication
     stdin_open: true
     tty: true
-    restart: unless-stopped
+    # No restart policy - interactive service
 
+# ============================================================================
+# Networks
+# ============================================================================
 networks:
   haystack-network:
-    name: haystack-network
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
+# ============================================================================
+# Volumes for Persistent Data
+# ============================================================================
 volumes:
   redis-data:
+    driver: local
   store-1-data:
+    driver: local
   store-2-data:
+    driver: local
   store-3-data:
+    driver: local
   store-4-data:
+    driver: local
   store-5-data:
+    driver: local
   directory-1-data:
+    driver: local
   directory-2-data:
+    driver: local
   directory-3-data:
-  replication-data:
+    driver: local
